@@ -109,6 +109,25 @@ class DocumentRecord(BaseModel):
     audit: list[AuditEntry] = Field(default_factory=list)
     created_at: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
 
+# ── Email Record ─────────────────────────────────────────────────────────────
+
+class EmailReply(BaseModel):
+    from_addr: str
+    date: str
+    subject: str
+    body: str
+    processed: bool = False
+
+class EmailRecord(BaseModel):
+    email_id: str = Field(default_factory=lambda: f"email_{uuid.uuid4().hex[:8]}")
+    doc_id: str
+    version: int = 1
+    message_id: str = ""
+    to_emails: list[str] = Field(default_factory=list)
+    subject: str = ""
+    sent_at: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
+    replies: list[EmailReply] = Field(default_factory=list)
+
 # ── University Profile ────────────────────────────────────────────────────────
 
 class UniversityProfile(BaseModel):

@@ -96,6 +96,11 @@ def page_library():
                         st.session_state["page"] = "Process"
                         st.rerun()
 
+            # Inbox checker for approved docs
+            if doc.state == "approved":
+                with st.expander("📬 Email Replies & Revision"):
+                    page_inbox(doc)
+
 
 # ── Page: New Document ────────────────────────────────────────────────────────
 
@@ -134,6 +139,7 @@ def page_new_document():
             "detected_gaps": [], "generated_fills": [], "approved_fills": [],
             "docx_path": None, "pdf_path": None,
             "qa_report": None, "feedback": "", "version": 0, "final": False,
+            "email_record_id": None,
         }
 
         st.session_state["thread_id"] = doc.doc_id
@@ -172,6 +178,8 @@ def page_process():
             page_content_review(iv)
         elif kind == "preview":
             page_preview(iv)
+        elif kind == "email_gate":
+            page_email_gate(iv)
         else:
             st.info(f"Waiting at: `{kind}`")
     else:
@@ -331,6 +339,138 @@ def _render_preview(content_dict: dict):
                 st.caption(f"CO-PO Matrix: {po_count} POs, scale: {subj.copo.get('scale', [])}")
 
 
+# ── Gate 3: Email Recipients ──────────────────────────────────────────────────
+
+def page_email_gate(iv: dict):
+    st.header("📧 Send for External Review")
+    st.success("✅ Document approved and exported! Now send it to reviewers.")
+
+    col1, col2 = st.columns([3, 1])
+    with col1:
+        st.subheader("Document Ready")
+        st.write(f"**Program:** {iv.get('program')}  |  **Semester:** {iv.get('semester')}  |  **Version:** {iv.get('version')}")
+
+        for path_key, label in [("docx_path", "DOCX"), ("pdf_path", "PDF")]:
+            p = iv.get(path_key)
+            if p and Path(p).exists():
+                with open(p, "rb") as f:
+                    st.download_button(f"⬇ {label}", f, Path(p).name)
+
+    with col2:
+        st.subheader("Email Configuration")
+        import os
+        sender = os.getenv("EMAIL_SENDER", "")
+        if sender:
+            st.success(f"Sender: {sender}")
+        else:
+            st.warning("EMAIL_SENDER not set in .env")
+
+    st.divider()
+    st.subheader("Recipient Email IDs")
+    st.caption("Enter the email addresses of reviewers (HODs, BOS coordinators, subject experts).")
+
+    raw_emails = st.text_area(
+        "Email addresses (one per line or comma-separated)",
+        placeholder="hod@university.ac.in\nbos.coordinator@university.ac.in\nsubject.expert@gmail.com",
+        height=120,
+    )
+
+    col_send, col_skip = st.columns(2)
+    with col_send:
+        if st.button("📤 Send Review Email", type="primary"):
+            emails = [e.strip() for e in raw_emails.replace(",", "\n").splitlines() if e.strip()]
+            if not emails:
+                st.error("Please enter at least one email address.")
+            else:
+                with st.spinner(f"Sending email to {len(emails)} recipient(s)…"):
+                    _invoke({"to_emails": emails})
+                st.success(f"Email sent to: {', '.join(emails)}")
+                st.session_state["page"] = "Library"
+                st.rerun()
+
+    with col_skip:
+        if st.button("Skip — Save to Library Only"):
+            _invoke({"to_emails": []})
+            st.session_state["page"] = "Library"
+            st.rerun()
+
+
+# ── Inbox: Check Replies ───────────────────────────────────────────────────────
+
+def page_inbox(doc: "DocumentRecord"):
+    """Show email records and check for replies for a given document."""
+    from ase.notify.inbox import check_replies, extract_feedback_text
+    from ase.store.db import list_email_records, save_email_record, load_doc
+    from ase.schemas.models import EmailReply
+
+    email_records = list_email_records(doc.doc_id)
+    if not email_records:
+        st.info("No emails sent for this document yet.")
+        return
+
+    for rec in email_records:
+        with st.expander(f"📨 Sent v{rec.version} → {', '.join(rec.to_emails)}  ·  `{rec.sent_at[:10]}`"):
+            failed = rec.message_id.startswith("FAILED:")
+            if failed:
+                st.error(f"Send failed: {rec.message_id}")
+            else:
+                st.write(f"**Subject:** {rec.subject}")
+                st.write(f"**Message-ID:** `{rec.message_id}`")
+
+            if not failed:
+                if st.button("🔄 Check for Replies", key=f"check_{rec.email_id}"):
+                    with st.spinner("Checking inbox…"):
+                        replies, err = check_replies(rec.message_id)
+                    if err:
+                        st.error(f"Inbox error: {err}")
+                    elif not replies:
+                        st.info("No replies found yet.")
+                    else:
+                        new_replies = []
+                        existing_bodies = {r.body for r in rec.replies}
+                        for r in replies:
+                            if r.body not in existing_bodies:
+                                new_replies.append(r)
+                                rec.replies.append(r)
+                        save_email_record(rec)
+                        if new_replies:
+                            st.success(f"{len(new_replies)} new reply(ies) found!")
+                        else:
+                            st.info("No new replies since last check.")
+
+            # Show stored replies
+            if rec.replies:
+                st.subheader(f"{len(rec.replies)} Reply(ies)")
+                for i, reply in enumerate(rec.replies):
+                    with st.container(border=True):
+                        st.write(f"**From:** {reply.from_addr}  |  **Date:** {reply.date}")
+                        st.text_area("Reply content", reply.body, height=120, key=f"reply_{rec.email_id}_{i}", disabled=True)
+
+                        if not reply.processed:
+                            if st.button("🔁 Use this reply as revision input", key=f"use_{rec.email_id}_{i}"):
+                                _start_email_revision(doc, rec, reply, extract_feedback_text([reply]))
+                                reply.processed = True
+                                save_email_record(rec)
+                                st.success("Revision started! Go to **Process** tab.")
+                                st.rerun()
+
+
+def _start_email_revision(doc, rec, reply, feedback_text: str):
+    """Start a new graph run for a revision based on an email reply."""
+    from ase.store.db import load_doc
+    full_doc = load_doc(doc.doc_id)
+    # Find the latest approved version for its files
+    latest = next((v for v in reversed(full_doc.versions) if v.state == "approved"), None)
+    if not latest:
+        st.error("No approved version found to revise.")
+        return
+
+    # Resume from assemble with feedback
+    config = {"configurable": {"thread_id": doc.doc_id}}
+    st.session_state["thread_id"] = doc.doc_id
+    _invoke({"approved": False, "feedback": f"Email reviewer feedback:\n\n{feedback_text}"})
+
+
 # ── Navigation ────────────────────────────────────────────────────────────────
 
 def main():
@@ -347,8 +487,11 @@ def main():
             iv = _interrupt()
             if iv:
                 kind = iv.get("type", "")
-                labels = {"content_review": "✏️ Awaiting content review",
-                          "preview": "🔍 Awaiting preview approval"}
+                labels = {
+                    "content_review": "✏️ Awaiting content review",
+                    "preview":        "🔍 Awaiting preview approval",
+                    "email_gate":     "📧 Awaiting email recipients",
+                }
                 st.info(labels.get(kind, f"⏸ {kind}"))
             elif _next():
                 st.info("⏳ Processing…")

@@ -1,10 +1,11 @@
 """
-LangGraph orchestration — clean 2-gate flow:
+LangGraph orchestration — 3-gate flow:
 
   ingest → analyze_template → parse_content → detect_gaps
-       → generate_gaps → [GATE 1: content approval]
-       → assemble → [GATE 2: preview + feedback]
-       → export (DOCX + PDF) → store
+       → generate_fills → [GATE 1: content approval per section]
+       → assemble → [GATE 2: preview + feedback loop]
+       → export (DOCX + PDF) → [GATE 3: email recipients]
+       → send_email → END
 """
 from __future__ import annotations
 import json
@@ -19,8 +20,9 @@ from ase.analysis.content import extract_content
 from ase.analysis.gap_detector import detect_gaps, fill_all_gaps, apply_approved_content
 from ase.render.docx_builder import build_docx, export_pdf
 from ase.qa.validator import validate
+from ase.notify.emailer import send_review_email
 from ase.schemas.models import (
-    DocumentRecord, TemplateBlueprint, ContentModel, AuditEntry,
+    DocumentRecord, TemplateBlueprint, ContentModel, AuditEntry, EmailRecord,
 )
 from ase.store import db
 
@@ -45,6 +47,7 @@ class ASEState(TypedDict):
     feedback: str                     # human feedback from preview gate
     version: int
     final: bool
+    email_record_id: Optional[str]    # stored after email is sent
 
 
 # ── Utilities ─────────────────────────────────────────────────────────────────
@@ -250,13 +253,65 @@ def node_export(state: ASEState) -> dict:
     ))
     doc.current_version = ver_num
 
-    # PDF export
     pdf_path = export_pdf(state["docx_path"])
     if pdf_path:
         doc.versions[-1].pdf_path = pdf_path
 
     db.save_doc(doc)
     return {"pdf_path": pdf_path}
+
+
+def node_email_gate(state: ASEState) -> dict:
+    """
+    GATE 3 — Ask for reviewer email IDs after the document is finalized.
+    Human provides email addresses; system sends the email.
+    """
+    decision: dict = interrupt({
+        "type": "email_gate",
+        "docx_path": state["docx_path"],
+        "pdf_path": state.get("pdf_path"),
+        "program": state["program"],
+        "semester": state["semester"],
+        "university": state["university_id"],
+        "version": state["version"],
+    })
+    return {"_email_decision": decision}
+
+
+def node_send_email(state: ASEState) -> dict:
+    """Send the review email with DOCX + PDF attached to all provided email IDs."""
+    decision = state.get("_email_decision", {})
+    to_emails: list[str] = decision.get("to_emails", [])
+
+    if not to_emails:
+        return {"email_record_id": None}
+
+    content = ContentModel(**state["content_model"])
+    ok, message_id, err = send_review_email(
+        to_emails=to_emails,
+        program=content.program,
+        semester=content.semester,
+        university=state["university_id"].upper(),
+        version=state["version"],
+        docx_path=state["docx_path"],
+        pdf_path=state.get("pdf_path"),
+    )
+
+    rec = EmailRecord(
+        doc_id=state["doc_id"],
+        version=state["version"],
+        message_id=message_id,
+        to_emails=to_emails,
+        subject=f"[Review Request] {state['university_id'].upper()} — {content.program} | Semester {content.semester} Syllabus (v{state['version']})",
+    )
+    db.save_email_record(rec)
+
+    if not ok:
+        # Store the error but don't fail the graph
+        rec.message_id = f"FAILED: {err}"
+        db.save_email_record(rec)
+
+    return {"email_record_id": rec.email_id}
 
 
 # ── Routing ───────────────────────────────────────────────────────────────────
@@ -271,16 +326,18 @@ def build_graph():
     g = StateGraph(ASEState)
 
     for name, fn in [
-        ("ingest", node_ingest),
+        ("ingest",           node_ingest),
         ("analyze_template", node_analyze_template),
-        ("parse_content", node_parse_content),
-        ("detect_gaps", node_detect_gaps),
-        ("generate_fills", node_generate_fills),
-        ("review_content", node_review_content),     # GATE 1
-        ("assemble", node_assemble),
-        ("preview", node_preview),                   # GATE 2
-        ("apply_feedback", node_apply_feedback),
-        ("export", node_export),
+        ("parse_content",    node_parse_content),
+        ("detect_gaps",      node_detect_gaps),
+        ("generate_fills",   node_generate_fills),
+        ("review_content",   node_review_content),   # GATE 1 — content approval
+        ("assemble",         node_assemble),
+        ("preview",          node_preview),          # GATE 2 — preview + feedback
+        ("apply_feedback",   node_apply_feedback),
+        ("export",           node_export),
+        ("email_gate",       node_email_gate),       # GATE 3 — collect email IDs
+        ("send_email",       node_send_email),
     ]:
         g.add_node(name, fn)
 
@@ -293,8 +350,10 @@ def build_graph():
     g.add_edge("review_content", "assemble")
     g.add_edge("assemble", "preview")
     g.add_conditional_edges("preview", route_preview, {"export": "export", "apply_feedback": "apply_feedback"})
-    g.add_edge("apply_feedback", "assemble")    # feedback → re-assemble → re-preview
-    g.add_edge("export", END)
+    g.add_edge("apply_feedback", "assemble")
+    g.add_edge("export", "email_gate")
+    g.add_edge("email_gate", "send_email")
+    g.add_edge("send_email", END)
 
     return g.compile(checkpointer=MemorySaver())
 
