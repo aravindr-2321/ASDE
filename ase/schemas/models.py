@@ -76,7 +76,8 @@ class VersionRecord(BaseModel):
     blueprint_version: int = 1
     docx_path: str = ""
     pdf_path: str = ""
-    content_model_path: str = ""   # persisted JSON for revision access
+    content_model_path: str = ""
+    semester_paths: dict = Field(default_factory=dict)  # {"1": {"docx":…,"pdf":…,"content":…}}
     qa_score: float = 0.0
     qa_report: dict = Field(default_factory=dict)
     generation_report: dict = Field(default_factory=dict)
@@ -101,7 +102,7 @@ class DocumentRecord(BaseModel):
     doc_id: str = Field(default_factory=lambda: f"doc_{uuid.uuid4().hex[:8]}")
     university_id: str
     program: str = ""
-    semester: int = 1
+    num_semesters: int = 1
     inputs: dict = Field(default_factory=dict)
     state: DocState = "intake"
     current_version: int = 0

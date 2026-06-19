@@ -272,15 +272,16 @@ def empty_state(title: str, body: str = ""):
 </div>""", unsafe_allow_html=True)
 
 
-def doc_card_html(university: str, program: str, semester: int, version: int,
+def doc_card_html(university: str, program: str, num_semesters: int, version: int,
                   created: str, state: str) -> str:
     b = badge(state)
+    sem_label = f"{num_semesters} Semester(s)" if num_semesters > 1 else "1 Semester"
     return f"""
 <div class="doc-card">
   <div style="display:flex;justify-content:space-between;align-items:flex-start;">
     <div>
-      <h3>{university.upper()} &nbsp;·&nbsp; {program}</h3>
-      <p>Semester {semester} &nbsp;·&nbsp; Version {version} &nbsp;·&nbsp; {created[:10]}</p>
+      <h3>{university.upper()} &nbsp;·&nbsp; {program or "(program auto-detected)"}</h3>
+      <p>{sem_label} &nbsp;·&nbsp; Version {version} &nbsp;·&nbsp; {created[:10]}</p>
     </div>
     <div style="margin-top:2px;">{b}</div>
   </div>

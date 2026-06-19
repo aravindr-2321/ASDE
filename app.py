@@ -119,7 +119,7 @@ def page_library():
     section_title("Documents")
     for doc in docs:
         st.markdown(doc_card_html(
-            doc.university_id, doc.program, doc.semester,
+            doc.university_id, doc.program, doc.num_semesters,
             doc.current_version, doc.created_at, doc.state,
         ), unsafe_allow_html=True)
 
@@ -133,14 +133,24 @@ def page_library():
             with col2:
                 for ver in reversed(doc.versions):
                     if ver.state == "approved":
-                        if ver.docx_path and Path(ver.docx_path).exists():
-                            with open(ver.docx_path, "rb") as f:
-                                st.download_button("⬇ DOCX", f, Path(ver.docx_path).name,
-                                                   key=f"dx_{doc.doc_id}_{ver.version}")
-                        if ver.pdf_path and Path(ver.pdf_path).exists():
-                            with open(ver.pdf_path, "rb") as f:
-                                st.download_button("⬇ PDF", f, Path(ver.pdf_path).name,
-                                                   key=f"pdf_{doc.doc_id}_{ver.version}")
+                        # Multi-semester: show per-semester downloads if available
+                        if ver.semester_paths:
+                            for sem_str, paths in ver.semester_paths.items():
+                                for ftype, label in [("docx", f"⬇ Sem{sem_str} DOCX"), ("pdf", f"⬇ Sem{sem_str} PDF")]:
+                                    p = paths.get(ftype, "")
+                                    if p and Path(p).exists():
+                                        with open(p, "rb") as f:
+                                            st.download_button(label, f, Path(p).name,
+                                                               key=f"{ftype}_{doc.doc_id}_{ver.version}_{sem_str}")
+                        else:
+                            if ver.docx_path and Path(ver.docx_path).exists():
+                                with open(ver.docx_path, "rb") as f:
+                                    st.download_button("⬇ DOCX", f, Path(ver.docx_path).name,
+                                                       key=f"dx_{doc.doc_id}_{ver.version}")
+                            if ver.pdf_path and Path(ver.pdf_path).exists():
+                                with open(ver.pdf_path, "rb") as f:
+                                    st.download_button("⬇ PDF", f, Path(ver.pdf_path).name,
+                                                       key=f"pdf_{doc.doc_id}_{ver.version}")
                         break
             with col3:
                 if doc.state == "review":
@@ -178,31 +188,34 @@ def page_new_document():
     page_header("New Document", "Upload a university template and NIAT syllabus to begin.", "➕")
 
     alert(
-        "The engine will <b>analyze the full template structure</b> (fonts, colors, layouts, tables), "
-        "detect any content gaps, generate missing sections, and guide you through review gates before "
-        "producing the final DOCX + PDF.",
+        "The engine analyzes the <b>full template structure</b> (fonts, colors, layouts, tables), "
+        "extracts the program name automatically from the syllabus, detects content gaps, and generates "
+        "<b>one formatted document per semester</b> through human-approval gates.",
         "info",
     )
 
     with st.form("upload_form", border=False):
         section_title("Document Details")
-        col1, col2, col3 = st.columns(3)
+        col1, col2 = st.columns(2)
         with col1:
-            univ_id  = st.text_input("University ID (slug)", placeholder="adypu")
+            univ_id       = st.text_input("University ID (slug)", placeholder="adypu")
         with col2:
-            program  = st.text_input("Program Name", placeholder="B.Tech CSE Data Science")
-        with col3:
-            semester = st.number_input("Semester", 1, 8, 1)
+            num_semesters = st.number_input(
+                "Number of Semesters to Generate", 1, 8, 1,
+                help="Enter 5 → engine generates Semester 1 through Semester 5 documents",
+            )
 
         section_title("Upload Files")
         col_a, col_b = st.columns(2)
         with col_a:
             st.markdown("**University Template** `.docx`")
+            st.caption("Defines fonts, colors, layout, tables — analyzed in full")
             tmpl_file = st.file_uploader("", type=["docx"], key="tmpl")
             if tmpl_file:
                 alert(f"✓ {tmpl_file.name}  ({round(tmpl_file.size/1024)}KB)", "success")
         with col_b:
             st.markdown("**NIAT Standard Syllabus** `.docx` or `.pdf`")
+            st.caption("Program name and all semester content extracted automatically")
             syll_file = st.file_uploader("", type=["docx", "pdf"], key="syll")
             if syll_file:
                 alert(f"✓ {syll_file.name}  ({round(syll_file.size/1024)}KB)", "success")
@@ -210,30 +223,40 @@ def page_new_document():
         submitted = st.form_submit_button("🚀  Analyze & Start Generation", type="primary", use_container_width=True)
 
     if submitted:
-        if not all([univ_id, program, tmpl_file, syll_file]):
-            alert("Please fill all fields and upload both files.", "warn")
+        if not all([univ_id, tmpl_file, syll_file]):
+            alert("Please enter a University ID and upload both files.", "warn")
             return
 
         tmpl_path = _save_upload(tmpl_file, f"{univ_id}_template")
         syll_path = _save_upload(syll_file, f"{univ_id}_syllabus")
 
-        doc = DocumentRecord(university_id=univ_id, program=program, semester=int(semester))
+        doc = DocumentRecord(university_id=univ_id, num_semesters=int(num_semesters))
         db.save_doc(doc)
 
         initial = {
-            "doc_id": doc.doc_id, "university_id": univ_id,
-            "template_path": tmpl_path, "syllabus_path": syll_path,
-            "program": program, "semester": int(semester),
-            "blueprint": None, "content_model": None,
-            "detected_gaps": [], "generated_fills": [], "approved_fills": [],
-            "docx_path": None, "pdf_path": None,
-            "qa_report": None, "feedback": "", "version": 0, "final": False,
+            "doc_id": doc.doc_id,
+            "university_id": univ_id,
+            "template_path": tmpl_path,
+            "syllabus_path": syll_path,
+            "num_semesters": int(num_semesters),
+            "program": "",
+            "blueprint": None,
+            "semester_contents": {},
+            "semester_gaps": {},
+            "semester_fills": {},
+            "semester_approved_fills": {},
+            "semester_docx_paths": {},
+            "semester_pdf_paths": {},
+            "semester_qa_reports": {},
+            "feedback": "",
+            "version": 0,
+            "final": False,
             "email_record_id": None,
         }
         st.session_state["thread_id"] = doc.doc_id
         st.session_state["page"] = "Process"
 
-        with st.spinner("Analyzing template and parsing syllabus… (~30 seconds)"):
+        with st.spinner(f"Analyzing template and extracting {num_semesters} semester(s)… (~30–60 s)"):
             try:
                 graph.invoke(initial, {"configurable": {"thread_id": doc.doc_id}})
             except Exception as e:
@@ -281,99 +304,159 @@ def page_process():
 
 def _gate_content_review(iv: dict):
     page_header("Review Generated Content", "Approve or edit LLM-generated sections before assembly.", "✏️")
-    fills = iv.get("fills", [])
+
+    semester_fills: dict = iv.get("semester_fills", {})
+    num_semesters: int   = iv.get("num_semesters", len(semester_fills))
+    total_fills = sum(len(v) for v in semester_fills.values())
 
     alert(
-        f"<b>{len(fills)} section(s)</b> had missing or insufficient content. "
-        "The LLM has generated content for each. Review, edit if needed, then confirm.",
+        f"<b>{total_fills} section(s)</b> across <b>{num_semesters} semester(s)</b> had missing content. "
+        "The LLM has generated content for each. Review, edit, then confirm.",
         "info",
     )
 
-    approved_items = []
-    for i, fill in enumerate(fills):
-        subj    = fill.get("subject", "Unknown")
-        section = fill.get("section", "")
-        note    = fill.get("generation_note", "")
-        items   = fill.get("content", [])
+    # Build semester tabs
+    sem_keys = sorted(semester_fills.keys(), key=int)
+    if not sem_keys:
+        alert("No gaps detected — click Confirm to assemble all semester documents.", "success")
+        if st.button("Confirm & Assemble All →", type="primary"):
+            _invoke({str(s): [] for s in range(1, num_semesters + 1)})
+            st.rerun()
+        return
 
-        review_card(subj, section, fill.get("gap", {}).get("reason", ""), "\n".join(items[:3]))
+    tab_labels = [f"Semester {k}" for k in sem_keys]
+    tabs = st.tabs(tab_labels)
 
-        with st.expander(f"Edit content for  {subj} — {section}"):
-            edited = []
-            for j, item in enumerate(items):
-                val = st.text_area(f"Item {j+1}", value=item,
-                                   key=f"fill_{i}_{j}", height=65, label_visibility="collapsed")
-                edited.append(val.strip())
+    approved_by_sem: dict = {}
 
-            action = st.radio("", ["✅ Approve this section", "❌ Skip (leave blank)"],
-                              key=f"act_{i}", horizontal=True)
-            if "Approve" in action:
-                approved_items.append({**fill, "approved_content": edited})
+    for tab, sem_str in zip(tabs, sem_keys):
+        fills = semester_fills[sem_str]
+        approved_items = []
+
+        with tab:
+            if not fills:
+                alert(f"No gaps for Semester {sem_str}.", "success")
+                approved_by_sem[sem_str] = []
+                continue
+
+            for i, fill in enumerate(fills):
+                subj    = fill.get("subject", "Unknown")
+                section = fill.get("section", "")
+                items   = fill.get("content", [])
+                review_card(subj, section, fill.get("gap", {}).get("reason", ""), "\n".join(items[:3]))
+
+                with st.expander(f"Edit  {subj} — {section}"):
+                    edited = []
+                    for j, item in enumerate(items):
+                        val = st.text_area(
+                            f"Item {j+1}", value=item,
+                            key=f"fill_s{sem_str}_{i}_{j}", height=65,
+                            label_visibility="collapsed",
+                        )
+                        edited.append(val.strip())
+
+                    action = st.radio(
+                        "", ["✅ Approve this section", "❌ Skip (leave blank)"],
+                        key=f"act_s{sem_str}_{i}", horizontal=True,
+                    )
+                    if "Approve" in action:
+                        approved_items.append({**fill, "approved_content": edited})
+
+            approved_by_sem[sem_str] = approved_items
 
     st.divider()
     col1, col2 = st.columns([2, 1])
     with col1:
-        alert(f"<b>{len([f for f in fills])} section(s)</b> reviewed. Click Confirm to assemble the document.", "info")
+        alert(f"Reviewed {num_semesters} semester(s). Click Confirm to assemble all documents.", "info")
     with col2:
-        if st.button("Confirm & Assemble Document →", type="primary", use_container_width=True):
-            _invoke(approved_items)
+        if st.button("Confirm & Assemble All Semesters →", type="primary", use_container_width=True):
+            _invoke(approved_by_sem)
             st.rerun()
 
 
 # ── Gate 2: Preview + Feedback ────────────────────────────────────────────────
 
 def _gate_preview(iv: dict):
+    ver           = iv.get("version", 1)
+    num_semesters = iv.get("num_semesters", 1)
+    sem_docx      = iv.get("semester_docx_paths", {})
+    sem_qa        = iv.get("semester_qa_reports", {})
+    sem_contents  = iv.get("semester_contents", {})
+
     page_header(
-        f"Document Preview  ·  v{iv.get('version', 1)}",
-        "Review the assembled document. Approve to export, or send feedback to revise.",
+        f"Document Preview  ·  v{ver}  ·  {num_semesters} Semester(s)",
+        "Review all semester documents. Approve to export or send feedback to revise.",
         "🔍",
     )
 
-    docx_path = iv.get("docx_path", "")
-    qa        = iv.get("qa_report", {})
-    content   = iv.get("content_model", {})
+    # Aggregate QA
+    scores = [sem_qa.get(str(s), {}).get("score", 0) for s in range(1, num_semesters + 1)]
+    avg_score = sum(scores) / len(scores) if scores else 0
+    passed_all = all(sem_qa.get(str(s), {}).get("status") == "pass" for s in range(1, num_semesters + 1))
 
-    # QA metrics
-    score = qa.get("score", 0)
     col_m1, col_m2, col_m3, _ = st.columns([1, 1, 1, 3])
-    col_m1.metric("QA Score", f"{score:.0%}")
-    col_m2.metric("Checks Passed", f"{qa.get('passed',0)}/{qa.get('total',0)}")
-    col_m3.metric("Status", "✅ Pass" if qa.get("status") == "pass" else "⚠️ Issues")
-
-    if qa.get("findings"):
-        with st.expander(f"⚠️ {len(qa['findings'])} QA issue(s)"):
-            for f in qa["findings"]:
-                st.caption(f"• `{f['check']}`:  {f['detail']}")
+    col_m1.metric("Avg QA Score", f"{avg_score:.0%}")
+    col_m2.metric("Semesters", num_semesters)
+    col_m3.metric("QA Status", "✅ All Pass" if passed_all else "⚠️ Issues")
 
     st.divider()
-    tab_preview, tab_approve, tab_feedback = st.tabs(["📋 Content Preview", "✅ Approve & Export", "🔄 Request Changes"])
+    main_tab, approve_tab, feedback_tab = st.tabs(
+        ["📋 Preview All Semesters", "✅ Approve & Export", "🔄 Request Changes"]
+    )
 
-    with tab_preview:
-        c1, c2 = st.columns([3, 1])
-        with c1:
-            _render_preview(content)
-        with c2:
-            if docx_path and Path(docx_path).exists():
-                with open(docx_path, "rb") as f:
-                    st.download_button("⬇ Download DOCX", f, Path(docx_path).name,
-                                       use_container_width=True)
-                alert("Download and open in Word for a pixel-perfect preview.", "info")
+    with main_tab:
+        # One sub-tab per semester
+        sem_keys = sorted(sem_docx.keys(), key=int)
+        if sem_keys:
+            sub_tabs = st.tabs([f"Semester {k}" for k in sem_keys])
+            for sub_tab, sem_str in zip(sub_tabs, sem_keys):
+                qa      = sem_qa.get(sem_str, {})
+                content = sem_contents.get(sem_str, {})
+                docx    = sem_docx.get(sem_str, "")
 
-    with tab_approve:
-        alert("Approving will export the document as <b>DOCX + PDF</b> and save it to the library.", "success")
+                with sub_tab:
+                    score = qa.get("score", 0)
+                    c1, c2 = st.columns([1, 1])
+                    c1.metric("QA Score", f"{score:.0%}")
+                    c2.metric("Status", "✅ Pass" if qa.get("status") == "pass" else "⚠️ Issues")
+
+                    if qa.get("findings"):
+                        with st.expander(f"⚠️ {len(qa['findings'])} issue(s)"):
+                            for f in qa["findings"]:
+                                st.caption(f"• `{f['check']}`:  {f['detail']}")
+
+                    col_content, col_dl = st.columns([3, 1])
+                    with col_content:
+                        _render_preview(content)
+                    with col_dl:
+                        if docx and Path(docx).exists():
+                            with open(docx, "rb") as f:
+                                st.download_button(f"⬇ Sem {sem_str} DOCX", f, Path(docx).name,
+                                                   use_container_width=True)
+                            alert("Open in Word for pixel-perfect view.", "info")
+
+    with approve_tab:
+        alert(
+            f"Approving will export all <b>{num_semesters} semester DOCX + PDF</b> files and save them to the library.",
+            "success",
+        )
         st.markdown("")
-        if st.button("✅  Approve & Export Final Document", type="primary", use_container_width=True):
+        if st.button("✅  Approve & Export All Semester Documents", type="primary", use_container_width=True):
             _invoke({"approved": True, "feedback": ""})
             st.rerun()
 
-    with tab_feedback:
-        alert("Describe what needs changing. The engine will revise and rebuild the document.", "warn")
+    with feedback_tab:
+        alert(
+            "Describe what needs changing across any semester. "
+            "The engine will apply your feedback and rebuild all affected documents.",
+            "warn",
+        )
         feedback = st.text_area(
             "Your feedback",
             placeholder=(
-                "e.g. The objectives for Web Development are too generic. "
-                "Please make them specific to React.js and Node.js. "
-                "Also add industry-relevant outcomes."
+                "e.g. The outcomes for Semester 2 Web Development are too generic — "
+                "make them specific to React.js and Node.js. "
+                "Also Semester 3 Data Science modules are missing deep learning topics."
             ),
             height=140,
         )
@@ -388,27 +471,37 @@ def _gate_preview(iv: dict):
 # ── Gate 3: Email Recipients ──────────────────────────────────────────────────
 
 def _gate_email(iv: dict):
-    page_header("Send for External Review", "Document approved! Send to reviewers via email.", "📧")
+    num_semesters = iv.get("num_semesters", 1)
+    sem_docx      = iv.get("semester_docx_paths", {})
+    sem_pdf       = iv.get("semester_pdf_paths", {})
 
-    alert("✅ <b>Document exported successfully.</b> You can skip emailing and save to Library only.", "success")
+    page_header("Send for External Review", f"All {num_semesters} semester documents exported! Send to reviewers.", "📧")
+    alert(f"✅ <b>{num_semesters} semester document(s) exported.</b> You can skip emailing and go straight to Library.", "success")
 
     col1, col2 = st.columns([2, 1])
     with col1:
-        section_title("Document Info")
+        section_title("Export Summary")
         st.markdown(f"""
 | Field | Value |
 |-------|-------|
-| Program | {iv.get('program')} |
-| Semester | {iv.get('semester')} |
+| Program | {iv.get('program') or '(auto-detected)'} |
+| Semesters | 1 – {num_semesters} |
 | University | {iv.get('university', '').upper()} |
 | Version | v{iv.get('version')} |
 """)
-        section_title("Attachments")
-        for pk, lbl in [("docx_path", "DOCX"), ("pdf_path", "PDF")]:
-            p = iv.get(pk)
-            if p and Path(p).exists():
-                with open(p, "rb") as f:
-                    st.download_button(f"⬇ {lbl}", f, Path(p).name, use_container_width=True)
+        section_title("Download All Files")
+        for sem_str in sorted(sem_docx.keys(), key=int):
+            docx = sem_docx.get(sem_str, "")
+            pdf  = sem_pdf.get(sem_str, "")
+            c1, c2 = st.columns(2)
+            if docx and Path(docx).exists():
+                with open(docx, "rb") as f:
+                    c1.download_button(f"⬇ Sem {sem_str} DOCX", f, Path(docx).name,
+                                       key=f"eg_docx_{sem_str}", use_container_width=True)
+            if pdf and Path(pdf).exists():
+                with open(pdf, "rb") as f:
+                    c2.download_button(f"⬇ Sem {sem_str} PDF", f, Path(pdf).name,
+                                       key=f"eg_pdf_{sem_str}", use_container_width=True)
 
     with col2:
         import os
@@ -462,7 +555,7 @@ def page_inbox_flow():
             unread = sum(r2.processed == False for rec in recs for r2 in rec.replies)
             col1, col2, col3 = st.columns([4, 1, 1])
             with col1:
-                st.markdown(f"**{doc.university_id.upper()}** — {doc.program}  ·  Sem {doc.semester}")
+                st.markdown(f"**{doc.university_id.upper()}** — {doc.program}  ·  {doc.num_semesters} Sem(s)")
                 st.caption(f"{len(recs)} email(s) sent  ·  {unread} unread replies")
             with col2:
                 st.markdown(badge(doc.state), unsafe_allow_html=True)
@@ -503,7 +596,7 @@ def _inbox_check_replies(flow: dict):
 
     page_header(
         f"Inbox — {doc.university_id.upper()} · {doc.program}",
-        f"Semester {doc.semester}  ·  {len(recs)} email thread(s)",
+        f"{doc.num_semesters} Semester(s)  ·  {len(recs)} email thread(s)",
         "📬",
     )
 
