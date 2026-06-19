@@ -156,6 +156,11 @@ def node_assemble(state: ASEState) -> dict:
     out = str(db.file_path(state["doc_id"], fname))
     build_docx(blueprint, content, out)
 
+    # Persist content model so revisions can load it without the checkpoint
+    content_json = str(db.file_path(state["doc_id"], f"content_v{ver}.json"))
+    from pathlib import Path
+    Path(content_json).write_text(content.model_dump_json(indent=2), encoding="utf-8")
+
     qa = validate(out, content, blueprint)
     return {"docx_path": out, "qa_report": qa, "version": ver}
 
@@ -244,9 +249,11 @@ def node_export(state: ASEState) -> dict:
     ver_num = state["version"]
 
     from ase.schemas.models import VersionRecord
+    content_json = str(db.file_path(state["doc_id"], f"content_v{ver_num}.json"))
     doc.versions.append(VersionRecord(
         version=ver_num,
         docx_path=state["docx_path"],
+        content_model_path=content_json,
         qa_score=state["qa_report"].get("score", 0.0) if state["qa_report"] else 0.0,
         qa_report=state["qa_report"] or {},
         state="approved",

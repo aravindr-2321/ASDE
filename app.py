@@ -395,30 +395,35 @@ def page_email_gate(iv: dict):
             st.rerun()
 
 
-# ── Inbox: Check Replies ───────────────────────────────────────────────────────
+# ── Inbox: Full Multi-Gate Revision Flow ─────────────────────────────────────
+#
+#  Step 1  check_replies   — show replies, check inbox
+#  Step 2  feedback_review — show reviewer's changes (LLM analyzed), operator approves
+#  Step 3  revising        — LLM revises doc, show new preview, operator approves
+#  Step 4  email_draft     — LLM drafts formal reply, operator edits & approves
+#  Step 5  done            — reply sent in thread
 
-def page_inbox(doc: "DocumentRecord"):
-    """Show email records and check for replies for a given document."""
-    from ase.notify.inbox import check_replies, extract_feedback_text
-    from ase.store.db import list_email_records, save_email_record, load_doc
-    from ase.schemas.models import EmailReply
+def page_inbox(doc):
+    """Inbox panel shown inside Library for each approved document."""
+    from ase.notify.inbox import check_replies
+    from ase.store.db import list_email_records, save_email_record
 
-    email_records = list_email_records(doc.doc_id)
-    if not email_records:
-        st.info("No emails sent for this document yet.")
+    recs = list_email_records(doc.doc_id)
+    if not recs:
+        st.info("No emails sent for this document.")
         return
 
-    for rec in email_records:
-        with st.expander(f"📨 Sent v{rec.version} → {', '.join(rec.to_emails)}  ·  `{rec.sent_at[:10]}`"):
+    for rec in recs:
+        label = f"📨  v{rec.version} → {', '.join(rec.to_emails)}  ·  {rec.sent_at[:10]}"
+        with st.expander(label):
             failed = rec.message_id.startswith("FAILED:")
             if failed:
                 st.error(f"Send failed: {rec.message_id}")
             else:
-                st.write(f"**Subject:** {rec.subject}")
-                st.write(f"**Message-ID:** `{rec.message_id}`")
+                st.caption(f"Subject: {rec.subject}")
 
             if not failed:
-                if st.button("🔄 Check for Replies", key=f"check_{rec.email_id}"):
+                if st.button("🔄 Check for New Replies", key=f"chk_{rec.email_id}"):
                     with st.spinner("Checking inbox…"):
                         replies, err = check_replies(rec.message_id)
                     if err:
@@ -426,60 +431,362 @@ def page_inbox(doc: "DocumentRecord"):
                     elif not replies:
                         st.info("No replies found yet.")
                     else:
-                        new_replies = []
-                        existing_bodies = {r.body for r in rec.replies}
+                        existing = {r.body for r in rec.replies}
+                        added = 0
                         for r in replies:
-                            if r.body not in existing_bodies:
-                                new_replies.append(r)
+                            if r.body not in existing:
                                 rec.replies.append(r)
+                                added += 1
                         save_email_record(rec)
-                        if new_replies:
-                            st.success(f"{len(new_replies)} new reply(ies) found!")
+                        if added:
+                            st.success(f"{added} new reply(ies) found!")
                         else:
                             st.info("No new replies since last check.")
 
-            # Show stored replies
-            if rec.replies:
-                st.subheader(f"{len(rec.replies)} Reply(ies)")
-                for i, reply in enumerate(rec.replies):
-                    with st.container(border=True):
-                        st.write(f"**From:** {reply.from_addr}  |  **Date:** {reply.date}")
-                        st.text_area("Reply content", reply.body, height=120, key=f"reply_{rec.email_id}_{i}", disabled=True)
+            for i, reply in enumerate(rec.replies):
+                with st.container(border=True):
+                    st.write(f"**From:** {reply.from_addr}  |  **{reply.date}**")
+                    st.text_area("Reply", reply.body, height=100,
+                                 key=f"rbody_{rec.email_id}_{i}", disabled=True)
 
-                        if not reply.processed:
-                            if st.button("🔁 Use this reply as revision input", key=f"use_{rec.email_id}_{i}"):
-                                _start_email_revision(doc, rec, reply, extract_feedback_text([reply]))
-                                reply.processed = True
-                                save_email_record(rec)
-                                st.success("Revision started! Go to **Process** tab.")
-                                st.rerun()
+                    badge = "✅ Processed" if reply.processed else "🔵 Pending"
+                    st.caption(badge)
+
+                    if not reply.processed:
+                        if st.button("🔁 Start Revision from this Reply",
+                                     key=f"start_{rec.email_id}_{i}", type="primary"):
+                            st.session_state["inbox_flow"] = {
+                                "step": "feedback_review",
+                                "doc_id": doc.doc_id,
+                                "email_record_id": rec.email_id,
+                                "reply_idx": i,
+                                "reply_body": reply.body,
+                                "reply_from": reply.from_addr,
+                                "original_subject": rec.subject,
+                                "original_message_id": rec.message_id,
+                                "prev_version": doc.current_version,
+                            }
+                            st.session_state["page"] = "Inbox"
+                            st.rerun()
 
 
-def _start_email_revision(doc, rec, reply, feedback_text: str):
-    """Start a new graph run for a revision based on an email reply."""
-    from ase.store.db import load_doc
-    full_doc = load_doc(doc.doc_id)
-    # Find the latest approved version for its files
-    latest = next((v for v in reversed(full_doc.versions) if v.state == "approved"), None)
-    if not latest:
-        st.error("No approved version found to revise.")
+def page_inbox_flow():
+    """Dedicated page that runs the multi-step revision-from-email flow."""
+    flow = ss("inbox_flow", {})
+    if not flow:
+        st.info("No active inbox revision. Start one from the Library.")
         return
 
-    # Resume from assemble with feedback
-    config = {"configurable": {"thread_id": doc.doc_id}}
-    st.session_state["thread_id"] = doc.doc_id
-    _invoke({"approved": False, "feedback": f"Email reviewer feedback:\n\n{feedback_text}"})
+    step = flow.get("step")
+
+    # ── Step 2: Show LLM analysis of reviewer feedback, ask operator to approve ──
+    if step == "feedback_review":
+        _inbox_step_feedback_review(flow)
+
+    # ── Step 3: Show revised document preview, ask operator to approve ────────
+    elif step == "revision_preview":
+        _inbox_step_revision_preview(flow)
+
+    # ── Step 4: Show LLM email draft, ask operator to approve before sending ──
+    elif step == "email_draft":
+        _inbox_step_email_draft(flow)
+
+    elif step == "done":
+        st.success("✅ Revision complete and reply sent to reviewer!")
+        if st.button("Back to Library"):
+            del st.session_state["inbox_flow"]
+            st.session_state["page"] = "Library"
+            st.rerun()
+
+
+def _inbox_step_feedback_review(flow: dict):
+    from ase.notify.reply_composer import analyze_feedback
+
+    st.header("📋 Reviewer Feedback Analysis")
+    st.caption(f"Document: `{flow['doc_id']}`  |  From: {flow['reply_from']}")
+
+    st.subheader("Reviewer's Reply")
+    st.info(flow["reply_body"])
+
+    # Run LLM analysis once and cache in flow
+    if "analysis" not in flow:
+        doc = db.load_doc(flow["doc_id"])
+        with st.spinner("Analyzing reviewer feedback…"):
+            analysis = analyze_feedback(flow["reply_body"], doc.program, doc.semester)
+        flow["analysis"] = analysis
+        st.session_state["inbox_flow"] = flow
+
+    analysis = flow["analysis"]
+    reviewer_name = analysis.get("reviewer_name", "Reviewer")
+    changes = analysis.get("changes_requested", [])
+    concern = analysis.get("general_concerns", "")
+
+    st.subheader(f"Changes Requested by {reviewer_name}")
+    if concern:
+        st.write(f"**Overall concern:** {concern}")
+    if changes:
+        for i, c in enumerate(changes, 1):
+            st.write(f"**{i}.** {c}")
+    else:
+        st.warning("No specific changes detected. The reply may be a general comment.")
+
+    priority = analysis.get("priority", "medium")
+    st.caption(f"Priority: `{priority}`  |  Sentiment: `{analysis.get('sentiment','neutral')}`")
+
+    st.divider()
+    st.subheader("Your Decision")
+    col1, col2 = st.columns(2)
+
+    with col1:
+        if st.button("✅ Approve — Work on These Changes", type="primary"):
+            flow["step"] = "revising"
+            st.session_state["inbox_flow"] = flow
+            _run_revision(flow)
+
+    with col2:
+        if st.button("❌ Skip — Don't Incorporate These Changes"):
+            _mark_reply_processed(flow)
+            del st.session_state["inbox_flow"]
+            st.session_state["page"] = "Library"
+            st.rerun()
+
+
+def _run_revision(flow: dict):
+    """Apply LLM revision and move to preview step."""
+    from ase.notify.reply_composer import apply_feedback_to_content
+    from ase.render.docx_builder import build_docx, export_pdf
+    from ase.schemas.models import TemplateBlueprint, ContentModel
+
+    doc = db.load_doc(flow["doc_id"])
+    latest = next((v for v in reversed(doc.versions) if v.state == "approved"), None)
+    if not latest or not latest.content_model_path:
+        st.error("Cannot find saved content model for revision.")
+        return
+
+    # Load persisted content model and blueprint
+    content_dict = __import__("json").loads(
+        Path(latest.content_model_path).read_text(encoding="utf-8")
+    )
+    profile = db.load_profile(doc.university_id)
+    blueprint_dict = profile.blueprints[-1] if profile.blueprints else {}
+
+    analysis = flow.get("analysis", {})
+    changes_requested = analysis.get("changes_requested", [])
+
+    with st.spinner("Applying reviewer changes to document…"):
+        updated_content, changes_made = apply_feedback_to_content(
+            content_dict, changes_requested, doc.program, doc.semester
+        )
+
+    # Build new DOCX + PDF
+    blueprint = TemplateBlueprint(**blueprint_dict)
+    content = ContentModel(**updated_content)
+    new_ver = doc.current_version + 1
+    fname = f"{doc.university_id}_{content.program.replace(' ','_')}_Sem{content.semester}_v{new_ver}.docx"
+    docx_path = str(db.file_path(doc.doc_id, fname))
+
+    with st.spinner("Building updated document…"):
+        build_docx(blueprint, content, docx_path)
+        pdf_path = export_pdf(docx_path)
+
+    # Save new content model
+    content_json_path = str(db.file_path(doc.doc_id, f"content_v{new_ver}.json"))
+    Path(content_json_path).write_text(content.model_dump_json(indent=2), encoding="utf-8")
+
+    flow.update({
+        "step": "revision_preview",
+        "new_version": new_ver,
+        "new_docx": docx_path,
+        "new_pdf": pdf_path,
+        "new_content": updated_content,
+        "changes_made": changes_made,
+        "content_json_path": content_json_path,
+    })
+    st.session_state["inbox_flow"] = flow
+    st.rerun()
+
+
+def _inbox_step_revision_preview(flow: dict):
+    st.header(f"🔍 Preview — Updated Version {flow.get('new_version')}")
+    st.caption(f"Document: `{flow['doc_id']}`")
+
+    c1, c2 = st.columns([3, 1])
+    with c1:
+        st.subheader("Changes Made")
+        for i, c in enumerate(flow.get("changes_made", []), 1):
+            st.write(f"**{i}.** {c}")
+        st.divider()
+        _render_preview(flow.get("new_content", {}))
+
+    with c2:
+        for path_key, label in [("new_docx", "DOCX"), ("new_pdf", "PDF")]:
+            p = flow.get(path_key)
+            if p and Path(p).exists():
+                with open(p, "rb") as f:
+                    st.download_button(f"⬇ {label}", f, Path(p).name)
+
+        st.divider()
+        if st.button("✅ Approve — Generate Reply Email", type="primary"):
+            flow["step"] = "email_draft"
+            st.session_state["inbox_flow"] = flow
+            _generate_email_draft(flow)
+
+        if st.button("🔄 Revise Again"):
+            flow["step"] = "feedback_review"
+            st.session_state["inbox_flow"] = flow
+            st.rerun()
+
+
+def _generate_email_draft(flow: dict):
+    from ase.notify.reply_composer import generate_reply_body
+
+    doc = db.load_doc(flow["doc_id"])
+    analysis = flow.get("analysis", {})
+    reviewer_name = analysis.get("reviewer_name", "Reviewer")
+    feedback_summary = analysis.get("general_concerns", flow.get("reply_body", "")[:200])
+
+    docx_name = Path(flow.get("new_docx", "document.docx")).name
+    pdf_name = Path(flow.get("new_pdf", "document.pdf")).name if flow.get("new_pdf") else "N/A"
+
+    with st.spinner("Drafting formal reply email…"):
+        draft = generate_reply_body(
+            reviewer_name=reviewer_name,
+            feedback_summary=feedback_summary,
+            changes_made=flow.get("changes_made", []),
+            program=doc.program,
+            semester=doc.semester,
+            university=doc.university_id.upper(),
+            prev_version=flow.get("prev_version", 1),
+            new_version=flow.get("new_version", 2),
+            docx_name=docx_name,
+            pdf_name=pdf_name,
+        )
+
+    flow["email_draft"] = draft
+    flow["reviewer_name"] = reviewer_name
+    st.session_state["inbox_flow"] = flow
+    st.rerun()
+
+
+def _inbox_step_email_draft(flow: dict):
+    from ase.notify.emailer import send_thread_reply
+    from ase.store.db import load_email_record, save_email_record
+
+    st.header("📧 Approve Reply Email Before Sending")
+    st.caption(
+        "The email below was drafted by the LLM based on the reviewer's feedback "
+        "and the changes incorporated. Review and edit before approving."
+    )
+
+    col1, col2 = st.columns([2, 1])
+
+    with col1:
+        st.subheader("Email Draft")
+        edited_body = st.text_area(
+            "Email body (edit if needed)",
+            value=flow.get("email_draft", ""),
+            height=400,
+            key="final_email_body",
+        )
+        doc = db.load_doc(flow["doc_id"])
+        subject = flow.get("original_subject", "")
+        reply_subject = subject if subject.startswith("Re:") else f"Re: {subject}"
+        st.info(f"**Subject:** {reply_subject}")
+
+    with col2:
+        st.subheader("Send Details")
+        rec = load_email_record(flow["email_record_id"])
+        to_email = rec.to_emails[0] if rec.to_emails else ""
+        st.write(f"**To:** {', '.join(rec.to_emails)}")
+        st.write(f"**In reply to:** `{flow.get('original_message_id', '')[:40]}…`")
+
+        for path_key, label in [("new_docx", "DOCX"), ("new_pdf", "PDF")]:
+            p = flow.get(path_key)
+            if p and Path(p).exists():
+                with open(p, "rb") as f:
+                    st.download_button(f"Preview {label}", f, Path(p).name)
+
+        st.divider()
+        if st.button("✅ Approve & Send Reply", type="primary"):
+            attachments = [p for p in [flow.get("new_docx"), flow.get("new_pdf")] if p and Path(p).exists()]
+            with st.spinner("Sending reply…"):
+                for email_addr in rec.to_emails:
+                    ok, new_mid, err = send_thread_reply(
+                        to_email=email_addr,
+                        original_subject=flow.get("original_subject", ""),
+                        original_message_id=flow.get("original_message_id", ""),
+                        body=edited_body,
+                        attachments=attachments,
+                    )
+                    if not ok:
+                        st.error(f"Failed to send to {email_addr}: {err}")
+                        return
+
+            # Mark reply as processed + update doc version
+            _mark_reply_processed(flow)
+            _save_new_version(flow, doc)
+
+            st.success(f"✅ Reply sent to {', '.join(rec.to_emails)} in the same thread!")
+            flow["step"] = "done"
+            st.session_state["inbox_flow"] = flow
+            st.rerun()
+
+        if st.button("✏️ Regenerate Email Draft"):
+            del flow["email_draft"]
+            st.session_state["inbox_flow"] = flow
+            _generate_email_draft(flow)
+
+
+def _mark_reply_processed(flow: dict):
+    from ase.store.db import load_email_record, save_email_record
+    try:
+        rec = load_email_record(flow["email_record_id"])
+        idx = flow.get("reply_idx", 0)
+        if idx < len(rec.replies):
+            rec.replies[idx].processed = True
+        save_email_record(rec)
+    except Exception:
+        pass
+
+
+def _save_new_version(flow: dict, doc):
+    from ase.schemas.models import VersionRecord, AuditEntry
+    doc.versions.append(VersionRecord(
+        version=flow["new_version"],
+        docx_path=flow.get("new_docx", ""),
+        pdf_path=flow.get("new_pdf", ""),
+        content_model_path=flow.get("content_json_path", ""),
+        state="approved",
+    ))
+    doc.current_version = flow["new_version"]
+    doc.audit.append(AuditEntry(
+        from_state="approved", to_state="approved",
+        by="email-revision",
+        note=f"Revised to v{flow['new_version']} from reviewer feedback",
+    ))
+    db.save_doc(doc)
 
 
 # ── Navigation ────────────────────────────────────────────────────────────────
 
 def main():
+    PAGES = ["Library", "New Document", "Process", "Inbox"]
     with st.sidebar:
         st.title("📄 ASDE")
         st.caption("Academic Syllabus Document Engine")
-        page = st.radio("", ["Library", "New Document", "Process"],
-                        index=["Library", "New Document", "Process"].index(ss("page", "Library")))
+        page = st.radio("", PAGES,
+                        index=PAGES.index(ss("page", "Library")))
         st.session_state["page"] = page
+
+        if ss("inbox_flow"):
+            st.divider()
+            step_labels = {
+                "feedback_review": "📋 Reviewer feedback",
+                "revision_preview": "🔍 Preview revision",
+                "email_draft":     "📧 Approve email",
+                "done":            "✅ Reply sent",
+            }
+            st.info(step_labels.get(ss("inbox_flow", {}).get("step", ""), "📬 Inbox revision active"))
 
         if ss("thread_id"):
             st.divider()
@@ -504,6 +811,8 @@ def main():
         page_new_document()
     elif page == "Process":
         page_process()
+    elif page == "Inbox":
+        page_inbox_flow()
 
 
 if __name__ == "__main__":

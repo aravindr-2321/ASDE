@@ -115,6 +115,46 @@ def send_review_email(
         return False, "", str(e)
 
 
+def send_thread_reply(
+    to_email: str,
+    original_subject: str,
+    original_message_id: str,
+    body: str,
+    attachments: list[str],
+) -> tuple[bool, str, str]:
+    """Send a reply in the same email thread (In-Reply-To + References headers)."""
+    cfg = _smtp_config()
+    if not cfg["sender"] or not cfg["password"]:
+        return False, "", "EMAIL_SENDER or EMAIL_PASSWORD not configured in .env"
+
+    msg = MIMEMultipart()
+    msg["From"]       = cfg["sender"]
+    msg["To"]         = to_email
+    msg["Date"]       = formatdate(localtime=True)
+    msg["Message-ID"] = make_msgid(domain=cfg["sender"].split("@")[-1])
+    msg["In-Reply-To"] = original_message_id
+    msg["References"]  = original_message_id
+    msg["Subject"] = (
+        original_subject if original_subject.startswith("Re:")
+        else f"Re: {original_subject}"
+    )
+
+    msg.attach(MIMEText(body, "plain"))
+    for path in attachments:
+        if Path(path).exists():
+            _attach_file(msg, path)
+
+    try:
+        with smtplib.SMTP(cfg["smtp_host"], cfg["smtp_port"]) as server:
+            server.ehlo()
+            server.starttls()
+            server.login(cfg["sender"], cfg["password"])
+            server.sendmail(cfg["sender"], [to_email], msg.as_string())
+        return True, msg["Message-ID"], ""
+    except Exception as e:
+        return False, "", str(e)
+
+
 def _attach_file(msg: MIMEMultipart, path: str):
     with open(path, "rb") as f:
         part = MIMEBase("application", "octet-stream")

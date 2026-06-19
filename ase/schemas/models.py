@@ -76,6 +76,7 @@ class VersionRecord(BaseModel):
     blueprint_version: int = 1
     docx_path: str = ""
     pdf_path: str = ""
+    content_model_path: str = ""   # persisted JSON for revision access
     qa_score: float = 0.0
     qa_report: dict = Field(default_factory=dict)
     generation_report: dict = Field(default_factory=dict)
