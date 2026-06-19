@@ -7,3 +7,4 @@ streamlit>=1.40.0
 pillow>=11.0.0
 requests>=2.31.0
 python-dotenv>=1.0.0
+docx2pdf>=0.1.8

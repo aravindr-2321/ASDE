@@ -1,24 +1,26 @@
-"""LangGraph orchestration: intake → analyze → clarify (gate) → generate → assemble → QA → review (gate) → export."""
+"""
+LangGraph orchestration — clean 2-gate flow:
+
+  ingest → analyze_template → parse_content → detect_gaps
+       → generate_gaps → [GATE 1: content approval]
+       → assemble → [GATE 2: preview + feedback]
+       → export (DOCX + PDF) → store
+"""
 from __future__ import annotations
 import json
-from typing import Any, Optional, TypedDict
+from typing import Optional, TypedDict
 from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.types import interrupt, Command
 
-from ase import config  # noqa — loads env
 from ase.ingestion.parser import ingest
 from ase.analysis.blueprint import extract_blueprint
 from ase.analysis.content import extract_content
-from ase.clarify.gate import generate_questions, apply_memory, get_ref_decision
-from ase.generate.academic import generate_objectives_outcomes, refine_module_topics
-from ase.references.engine import generate_references, has_ref_sections
-from ase.render.docx_builder import build_docx
+from ase.analysis.gap_detector import detect_gaps, fill_all_gaps, apply_approved_content
+from ase.render.docx_builder import build_docx, export_pdf
 from ase.qa.validator import validate
-from ase.approval.workflow import add_version
 from ase.schemas.models import (
-    DocumentRecord, TemplateBlueprint, ContentModel,
-    ClarificationRecord, AuditEntry,
+    DocumentRecord, TemplateBlueprint, ContentModel, AuditEntry,
 )
 from ase.store import db
 
@@ -30,251 +32,273 @@ class ASEState(TypedDict):
     university_id: str
     template_path: str
     syllabus_path: str
-    custom_instructions: str
     program: str
     semester: int
     blueprint: Optional[dict]
     content_model: Optional[dict]
-    clarification_answers: dict        # question → answer
-    ref_decision: Optional[str]        # "yes" | "no"
-    generated: bool
+    detected_gaps: list[dict]
+    generated_fills: list[dict]       # LLM-generated content pending human review
+    approved_fills: list[dict]        # human-approved content
     docx_path: Optional[str]
+    pdf_path: Optional[str]
     qa_report: Optional[dict]
-    generation_report: dict
-    error: Optional[str]
+    feedback: str                     # human feedback from preview gate
+    version: int
+    final: bool
 
 
-# ── Helper ────────────────────────────────────────────────────────────────────
+# ── Utilities ─────────────────────────────────────────────────────────────────
 
-def _update_doc_state(doc_id: str, state: str, by: str = "system"):
+def _log(doc_id: str, from_: str, to_: str, note: str = "system"):
     doc = db.load_doc(doc_id)
-    doc.audit.append(AuditEntry(from_state=doc.state, to_state=state, by=by))  # type: ignore
-    doc.state = state  # type: ignore
+    doc.audit.append(AuditEntry(from_state=from_, to_state=to_, by=note))
+    doc.state = to_  # type: ignore[assignment]
     db.save_doc(doc)
 
 
 # ── Nodes ─────────────────────────────────────────────────────────────────────
 
 def node_ingest(state: ASEState) -> dict:
-    _update_doc_state(state["doc_id"], "analyzing")
-    template_data = ingest(state["template_path"])
-    syllabus_data = ingest(state["syllabus_path"])
-    # Store raw data in doc inputs
+    """Parse both files and store raw data on the doc record."""
+    _log(state["doc_id"], "intake", "analyzing")
+    t_data = ingest(state["template_path"])
+    s_data = ingest(state["syllabus_path"])
     doc = db.load_doc(state["doc_id"])
-    doc.inputs["template_hash"] = template_data.get("hash", "")
-    doc.inputs["syllabus_hash"] = syllabus_data.get("hash", "")
-    doc.inputs["template_raw"] = json.dumps(template_data)
-    doc.inputs["syllabus_raw"] = json.dumps(syllabus_data)
+    doc.inputs.update({
+        "template_hash": t_data.get("hash", ""),
+        "syllabus_hash": s_data.get("hash", ""),
+        "template_raw": json.dumps(t_data),
+        "syllabus_raw": json.dumps(s_data),
+    })
     db.save_doc(doc)
     return {}
 
 
-def node_analyze(state: ASEState) -> dict:
+def node_analyze_template(state: ASEState) -> dict:
+    """Extract the full Template Blueprint — structure, fonts, colors, layout, margins."""
     doc = db.load_doc(state["doc_id"])
-    template_data = json.loads(doc.inputs["template_raw"])
-    bp = extract_blueprint(template_data, state["university_id"])
-    blueprint_dict = bp.model_dump()
-    # Save blueprint to university profile
+    t_data = json.loads(doc.inputs["template_raw"])
+    bp = extract_blueprint(t_data, state["university_id"])
+
+    # Persist blueprint to university profile
     profile = db.load_profile(state["university_id"])
-    profile.blueprints = [blueprint_dict]  # latest blueprint
+    profile.blueprints = [bp.model_dump()]
+    profile.display_name = profile.display_name or state["university_id"].upper()
     db.save_profile(profile)
-    return {"blueprint": blueprint_dict}
+
+    return {"blueprint": bp.model_dump()}
 
 
 def node_parse_content(state: ASEState) -> dict:
+    """Extract the ContentModel from the NIAT syllabus."""
     doc = db.load_doc(state["doc_id"])
-    syllabus_data = json.loads(doc.inputs["syllabus_raw"])
-    content = extract_content(syllabus_data, state["program"], state["semester"])
-    content_dict = content.model_dump()
+    s_data = json.loads(doc.inputs["syllabus_raw"])
+    content = extract_content(s_data, state["program"], state["semester"])
+
     doc.program = content.program
     doc.semester = content.semester
     db.save_doc(doc)
-    return {"content_model": content_dict}
+    return {"content_model": content.model_dump()}
 
 
-def node_clarify(state: ASEState) -> dict:
-    """Human interrupt gate: ask pending questions, wait for answers."""
+def node_detect_gaps(state: ASEState) -> dict:
+    """Compare template sections with content model — find what's missing."""
+    _log(state["doc_id"], "analyzing", "drafting")
     blueprint = TemplateBlueprint(**state["blueprint"])
     content = ContentModel(**state["content_model"])
-    profile = db.load_profile(state["university_id"])
+    gaps = detect_gaps(blueprint, content)
+    return {"detected_gaps": gaps}
 
-    questions = generate_questions(
-        blueprint, content, profile.clarification_memory, state["custom_instructions"]
-    )
-    _, pending = apply_memory(questions, profile.clarification_memory)
 
-    if not pending:
-        return {"clarification_answers": state.get("clarification_answers", {})}
+def node_generate_fills(state: ASEState) -> dict:
+    """LLM generates content for every detected gap."""
+    if not state["detected_gaps"]:
+        return {"generated_fills": []}
+    blueprint = TemplateBlueprint(**state["blueprint"])
+    content = ContentModel(**state["content_model"])
+    fills = fill_all_gaps(state["detected_gaps"], content, blueprint)
+    return {"generated_fills": fills}
 
-    _update_doc_state(state["doc_id"], "clarifying")
-    # Interrupt — pause until UI provides answers
-    answers: dict = interrupt({
-        "type": "questions",
-        "questions": [q.model_dump() for q in pending],
+
+def node_review_content(state: ASEState) -> dict:
+    """
+    GATE 1 — Human approves LLM-generated content section by section.
+    If no gaps were detected, this gate is skipped automatically.
+    """
+    fills = state.get("generated_fills", [])
+    if not fills:
+        return {"approved_fills": [], "content_model": state["content_model"]}
+
+    # Interrupt — UI presents each generated fill for approval/edit
+    approved: list[dict] = interrupt({
+        "type": "content_review",
+        "fills": fills,
+        "instruction": "Review each LLM-generated section. Approve, edit, or reject before assembly.",
     })
 
-    # Persist answers to university profile
-    for q in pending:
-        if q.question in answers:
-            q.answer = answers[q.question]
-            profile.clarification_memory.append(q)
-    db.save_profile(profile)
+    # Apply approved content back into the content model
+    content = ContentModel(**state["content_model"])
+    content = apply_approved_content(content, approved)
+    return {"approved_fills": approved, "content_model": content.model_dump()}
 
-    merged = {**state.get("clarification_answers", {}), **answers}
 
-    # Extract ref_decision from answers
-    ref_q_key = next(
-        (k for k in answers if "textbook" in k.lower() or "isbn" in k.lower()), None
+def node_assemble(state: ASEState) -> dict:
+    """Build the DOCX from blueprint + enriched content model."""
+    blueprint = TemplateBlueprint(**state["blueprint"])
+    content = ContentModel(**state["content_model"])
+    doc = db.load_doc(state["doc_id"])
+
+    ver = state.get("version", 0) + 1
+    fname = f"{state['university_id']}_{content.program.replace(' ','_')}_Sem{content.semester}_v{ver}.docx"
+    out = str(db.file_path(state["doc_id"], fname))
+    build_docx(blueprint, content, out)
+
+    qa = validate(out, content, blueprint)
+    return {"docx_path": out, "qa_report": qa, "version": ver}
+
+
+def node_preview(state: ASEState) -> dict:
+    """
+    GATE 2 — Show full document preview to human.
+    Human can approve (→ export) or give feedback (→ re-assemble).
+    """
+    _log(state["doc_id"], "drafting", "review")
+    decision: dict = interrupt({
+        "type": "preview",
+        "docx_path": state["docx_path"],
+        "qa_report": state["qa_report"],
+        "version": state["version"],
+        "content_model": state["content_model"],
+    })
+    feedback = decision.get("feedback", "").strip()
+    approved = decision.get("approved", False)
+
+    if approved:
+        return {"final": True, "feedback": ""}
+
+    # Store feedback so next assemble pass can use it
+    return {"final": False, "feedback": feedback}
+
+
+def node_apply_feedback(state: ASEState) -> dict:
+    """Re-generate content incorporating the human's feedback, then re-assemble."""
+    import anthropic
+    from ase.config import MODEL, MAX_TOKENS
+
+    client = anthropic.Anthropic()
+    content = ContentModel(**state["content_model"])
+    blueprint = TemplateBlueprint(**state["blueprint"])
+    feedback = state.get("feedback", "")
+
+    prompt = f"""The human reviewer gave this feedback on the assembled syllabus:
+
+FEEDBACK: {feedback}
+
+CURRENT CONTENT SUMMARY:
+Program: {content.program}, Semester: {content.semester}
+Subjects: {[s.name for s in content.subjects]}
+
+Apply the feedback. For each subject, return updated objectives and outcomes if they need changing.
+Return JSON:
+{{
+  "updates": [
+    {{
+      "subject": "Subject Name",
+      "objectives": ["updated CLO1...", "CLO2..."],
+      "outcomes": ["updated CO1...", "CO2..."]
+    }}
+  ]
+}}
+Return empty updates array if no changes are needed for a subject."""
+
+    resp = client.messages.create(
+        model=MODEL, max_tokens=MAX_TOKENS,
+        messages=[{"role": "user", "content": prompt}],
     )
-    ref_decision = answers.get(ref_q_key) if ref_q_key else None
+    raw = resp.content[0].text.strip()
+    if raw.startswith("```"):
+        raw = raw.split("```")[1]
+        if raw.startswith("json"):
+            raw = raw[4:]
 
-    return {"clarification_answers": merged, "ref_decision": ref_decision}
-
-
-def node_generate(state: ASEState) -> dict:
-    """Generate academic content (CO/CLO, refined modules)."""
-    _update_doc_state(state["doc_id"], "drafting")
-    blueprint = TemplateBlueprint(**state["blueprint"])
-    content = ContentModel(**state["content_model"])
-    gen_report: dict = {"subjects": []}
-
-    for i, subj in enumerate(content.subjects):
-        objs, outs = generate_objectives_outcomes(subj, blueprint, content.program, content.semester)
-        subj.generated_objectives = objs
-        subj.generated_outcomes = outs
-        subj = refine_module_topics(subj, blueprint)
-        content.subjects[i] = subj
-        gen_report["subjects"].append({
-            "name": subj.name,
-            "objectives_generated": len(objs),
-            "outcomes_generated": len(outs),
-            "modules_refined": len(subj.modules),
-        })
-
-    return {"content_model": content.model_dump(), "generation_report": gen_report, "generated": True}
-
-
-def node_build_refs(state: ASEState) -> dict:
-    """Generate IEEE references if user confirmed."""
-    blueprint = TemplateBlueprint(**state["blueprint"])
-    content = ContentModel(**state["content_model"])
-
-    # Check ref decision from clarification answers or stored profile
-    ref_dec = state.get("ref_decision")
-    if not ref_dec:
-        profile = db.load_profile(state["university_id"])
-        ref_dec = get_ref_decision(profile.clarification_memory)
-
-    if ref_dec and "yes" in ref_dec.lower():
-        for i, subj in enumerate(content.subjects):
-            tb, refs = generate_references(subj, blueprint, content.program, content.semester)
-            subj.generated_references = tb
-            subj.references = refs
-            content.subjects[i] = subj
+    data = json.loads(raw)
+    subj_map = {s.name: i for i, s in enumerate(content.subjects)}
+    for upd in data.get("updates", []):
+        idx = subj_map.get(upd["subject"])
+        if idx is not None:
+            if upd.get("objectives"):
+                content.subjects[idx].generated_objectives = upd["objectives"]
+            if upd.get("outcomes"):
+                content.subjects[idx].generated_outcomes = upd["outcomes"]
 
     return {"content_model": content.model_dump()}
 
 
-def node_assemble(state: ASEState) -> dict:
-    """Build the DOCX from blueprint + content model."""
-    blueprint = TemplateBlueprint(**state["blueprint"])
-    content = ContentModel(**state["content_model"])
-    doc = db.load_doc(state["doc_id"])
-
-    ver = doc.current_version + 1
-    filename = f"{state['university_id']}_{content.program}_Sem{content.semester}_v{ver}.docx"
-    output_path = str(db.file_path(state["doc_id"], filename))
-
-    build_docx(blueprint, content, output_path)
-    return {"docx_path": output_path}
-
-
-def node_qa(state: ASEState) -> dict:
-    blueprint = TemplateBlueprint(**state["blueprint"])
-    content = ContentModel(**state["content_model"])
-    report = validate(state["docx_path"], content, blueprint)
-    return {"qa_report": report}
-
-
-def node_review(state: ASEState) -> dict:
-    """Human interrupt gate: approval decision."""
-    doc = db.load_doc(state["doc_id"])
-    ver_doc = add_version(
-        doc,
-        docx_path=state["docx_path"],
-        qa_report=state["qa_report"],
-        generation_report=state["generation_report"],
-        blueprint_version=state["blueprint"].get("version", 1),
-    )
-    db.save_doc(ver_doc)
-
-    # Interrupt — wait for approver action
-    decision: dict = interrupt({
-        "type": "approval",
-        "doc_id": state["doc_id"],
-        "version": ver_doc.current_version,
-        "docx_path": state["docx_path"],
-        "qa_report": state["qa_report"],
-        "generation_report": state["generation_report"],
-    })
-    return {"_approval_decision": decision}
-
-
 def node_export(state: ASEState) -> dict:
-    """Store the final approved document."""
+    """Export DOCX + PDF and store as the authoritative approved file."""
+    _log(state["doc_id"], "review", "approved")
     doc = db.load_doc(state["doc_id"])
-    doc.audit.append(AuditEntry(from_state="review", to_state="approved", by="system"))
-    doc.state = "approved"
+    ver_num = state["version"]
+
+    from ase.schemas.models import VersionRecord
+    doc.versions.append(VersionRecord(
+        version=ver_num,
+        docx_path=state["docx_path"],
+        qa_score=state["qa_report"].get("score", 0.0) if state["qa_report"] else 0.0,
+        qa_report=state["qa_report"] or {},
+        state="approved",
+    ))
+    doc.current_version = ver_num
+
+    # PDF export
+    pdf_path = export_pdf(state["docx_path"])
+    if pdf_path:
+        doc.versions[-1].pdf_path = pdf_path
+
     db.save_doc(doc)
-    return {}
+    return {"pdf_path": pdf_path}
 
 
 # ── Routing ───────────────────────────────────────────────────────────────────
 
-def route_after_refs(state: ASEState) -> str:
-    blueprint = TemplateBlueprint(**state["blueprint"])
-    if has_ref_sections(blueprint):
-        return "build_refs"
-    return "assemble"
+def route_preview(state: ASEState) -> str:
+    return "export" if state.get("final") else "apply_feedback"
 
 
-def route_qa(state: ASEState) -> str:
-    report = state.get("qa_report", {})
-    return "review" if report.get("status") == "pass" else "assemble"  # retry once on fail
-
-
-# ── Graph construction ────────────────────────────────────────────────────────
+# ── Graph ─────────────────────────────────────────────────────────────────────
 
 def build_graph():
     g = StateGraph(ASEState)
 
-    g.add_node("ingest", node_ingest)
-    g.add_node("analyze", node_analyze)
-    g.add_node("parse_content", node_parse_content)
-    g.add_node("clarify", node_clarify)
-    g.add_node("generate", node_generate)
-    g.add_node("build_refs", node_build_refs)
-    g.add_node("assemble", node_assemble)
-    g.add_node("qa", node_qa)
-    g.add_node("review", node_review)
-    g.add_node("export", node_export)
+    for name, fn in [
+        ("ingest", node_ingest),
+        ("analyze_template", node_analyze_template),
+        ("parse_content", node_parse_content),
+        ("detect_gaps", node_detect_gaps),
+        ("generate_fills", node_generate_fills),
+        ("review_content", node_review_content),     # GATE 1
+        ("assemble", node_assemble),
+        ("preview", node_preview),                   # GATE 2
+        ("apply_feedback", node_apply_feedback),
+        ("export", node_export),
+    ]:
+        g.add_node(name, fn)
 
     g.set_entry_point("ingest")
-    g.add_edge("ingest", "analyze")
-    g.add_edge("analyze", "parse_content")
-    g.add_edge("parse_content", "clarify")
-    g.add_edge("clarify", "generate")
-    g.add_edge("generate", "build_refs")
-    g.add_edge("build_refs", "assemble")
-    g.add_edge("assemble", "qa")
-    g.add_conditional_edges("qa", route_qa, {"review": "review", "assemble": "assemble"})
-    g.add_edge("review", "export")
+    g.add_edge("ingest", "analyze_template")
+    g.add_edge("analyze_template", "parse_content")
+    g.add_edge("parse_content", "detect_gaps")
+    g.add_edge("detect_gaps", "generate_fills")
+    g.add_edge("generate_fills", "review_content")
+    g.add_edge("review_content", "assemble")
+    g.add_edge("assemble", "preview")
+    g.add_conditional_edges("preview", route_preview, {"export": "export", "apply_feedback": "apply_feedback"})
+    g.add_edge("apply_feedback", "assemble")    # feedback → re-assemble → re-preview
     g.add_edge("export", END)
 
     return g.compile(checkpointer=MemorySaver())
 
 
-# Singleton graph instance
 _graph = None
 
 def get_graph():

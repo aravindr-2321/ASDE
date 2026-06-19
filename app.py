@@ -1,272 +1,334 @@
 """ASDE — Academic Syllabus Document Engine · Streamlit UI"""
-import shutil
-import json
 from pathlib import Path
 import streamlit as st
 from langgraph.types import Command
 
 from ase.orchestrator.graph import get_graph
-from ase.schemas.models import DocumentRecord
+from ase.schemas.models import DocumentRecord, ContentModel
 from ase.store import db
 from ase.config import UPLOADS_DIR
 
 st.set_page_config(page_title="ASDE — Syllabus Engine", layout="wide", page_icon="📄")
-
 graph = get_graph()
 
-# ── Session helpers ───────────────────────────────────────────────────────────
 
-def ss(key, default=None):
-    return st.session_state.get(key, default)
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _config():
+def ss(k, d=None):
+    return st.session_state.get(k, d)
+
+def _cfg():
     return {"configurable": {"thread_id": ss("thread_id")}}
 
 def _graph_state():
     if not ss("thread_id"):
         return None
     try:
-        return graph.get_state(_config())
+        return graph.get_state(_cfg())
     except Exception:
         return None
 
-def _next_nodes():
-    s = _graph_state()
-    return list(s.next) if s else []
-
-def _interrupt_value():
-    """Return the interrupt payload from current graph state."""
+def _interrupt():
     s = _graph_state()
     if not s:
         return None
     for task in s.tasks:
-        if hasattr(task, "interrupts") and task.interrupts:
+        if getattr(task, "interrupts", None):
             return task.interrupts[0].value
     return None
 
-def _save_upload(file, prefix: str) -> str:
-    dest = UPLOADS_DIR / f"{prefix}_{file.name}"
+def _next():
+    s = _graph_state()
+    return list(s.next) if s else []
+
+def _save_upload(file, tag: str) -> str:
+    dest = UPLOADS_DIR / f"{tag}_{file.name}"
     dest.write_bytes(file.read())
     return str(dest)
 
+def _invoke(payload):
+    """Resume the graph with payload, ignore interrupt exceptions."""
+    try:
+        graph.invoke(Command(resume=payload), _cfg())
+    except Exception as e:
+        if "interrupt" not in str(e).lower():
+            st.error(f"Error: {e}")
 
-# ── Pages ─────────────────────────────────────────────────────────────────────
+
+# ── Page: Library ─────────────────────────────────────────────────────────────
 
 def page_library():
     st.header("📚 Document Library")
     docs = db.list_docs()
     if not docs:
-        st.info("No documents yet. Start with **New Document**.")
+        st.info("No documents yet. Go to **New Document** to start.")
         return
 
-    STATUS_COLOR = {
-        "approved": "🟢", "review": "🟡", "drafting": "🔵",
-        "clarifying": "🟠", "rejected": "🔴", "intake": "⚪",
-    }
+    state_icon = {"approved": "🟢", "review": "🟡", "drafting": "🔵",
+                  "clarifying": "🟠", "rejected": "🔴", "intake": "⚪", "analyzing": "🔵"}
+
     for doc in docs:
-        icon = STATUS_COLOR.get(doc.state, "⚪")
-        with st.expander(f"{icon} {doc.university_id.upper()} — {doc.program} | Sem {doc.semester}  ·  `{doc.doc_id}`"):
-            col1, col2 = st.columns([2, 1])
-            with col1:
-                st.write(f"**State:** {doc.state}  |  **Version:** {doc.current_version}  |  **Created:** {doc.created_at[:10]}")
-                if doc.approvals:
-                    last = doc.approvals[-1]
-                    st.write(f"**Last approval action:** {last.decision} by {last.reviewer} — *{last.notes or 'no notes'}*")
-            with col2:
+        icon = state_icon.get(doc.state, "⚪")
+        label = f"{icon}  **{doc.university_id.upper()}** — {doc.program} | Sem {doc.semester}"
+        with st.expander(label):
+            c1, c2 = st.columns([3, 1])
+            with c1:
+                st.write(f"**State:** `{doc.state}`  |  **Version:** {doc.current_version}  |  **Created:** {doc.created_at[:10]}")
+                if doc.audit:
+                    st.write("**Audit trail:**")
+                    for e in doc.audit[-5:]:
+                        st.caption(f"`{e.at[:19]}`  {e.from_state} → {e.to_state}  ({e.by})")
+            with c2:
+                # Download approved DOCX + PDF
+                for ver in reversed(doc.versions):
+                    if ver.state == "approved":
+                        if ver.docx_path and Path(ver.docx_path).exists():
+                            with open(ver.docx_path, "rb") as f:
+                                st.download_button("⬇ DOCX", f, Path(ver.docx_path).name, key=f"dx_{doc.doc_id}_{ver.version}")
+                        if ver.pdf_path and Path(ver.pdf_path).exists():
+                            with open(ver.pdf_path, "rb") as f:
+                                st.download_button("⬇ PDF", f, Path(ver.pdf_path).name, key=f"pdf_{doc.doc_id}_{ver.version}")
+                        break
+
                 if doc.state == "review":
-                    if st.button(f"Open Review", key=f"open_{doc.doc_id}"):
+                    if st.button("Open Review", key=f"rv_{doc.doc_id}"):
                         st.session_state["thread_id"] = doc.doc_id
-                        st.session_state["page"] = "Review"
+                        st.session_state["page"] = "Process"
                         st.rerun()
-                # Download approved docx
-                ver = next((v for v in reversed(doc.versions) if v.state == "approved"), None)
-                if ver and Path(ver.docx_path).exists():
-                    with open(ver.docx_path, "rb") as f:
-                        st.download_button("⬇ Download DOCX", f, file_name=Path(ver.docx_path).name)
 
-            if doc.audit:
-                st.write("**Audit Trail:**")
-                for entry in doc.audit:
-                    st.write(f"  `{entry.at[:19]}` {entry.from_state} → {entry.to_state} ({entry.by})")
 
+# ── Page: New Document ────────────────────────────────────────────────────────
 
 def page_new_document():
     st.header("➕ New Document")
+    st.caption("Upload the university template and the NIAT syllabus. The engine will handle the rest.")
 
-    with st.form("new_doc_form"):
-        col1, col2 = st.columns(2)
-        with col1:
-            university_id = st.text_input("University ID (slug)", placeholder="adypu")
-            program = st.text_input("Program Name", placeholder="B.Tech CSE Data Science")
-            semester = st.number_input("Semester", min_value=1, max_value=8, value=1)
-        with col2:
-            template_file = st.file_uploader("University Template (.docx)", type=["docx"])
-            syllabus_file = st.file_uploader("NIAT Syllabus (.docx or .pdf)", type=["docx", "pdf"])
+    with st.form("upload_form"):
+        c1, c2 = st.columns(2)
+        with c1:
+            univ_id  = st.text_input("University ID (short slug)", placeholder="adypu")
+            program  = st.text_input("Program Name", placeholder="B.Tech CSE Data Science")
+            semester = st.number_input("Semester", 1, 8, 1)
+        with c2:
+            tmpl_file  = st.file_uploader("University Template (.docx)", type=["docx"])
+            syll_file  = st.file_uploader("NIAT Standard Syllabus (.docx or .pdf)", type=["docx", "pdf"])
 
-        instructions = st.text_area(
-            "Custom Instructions / Context (optional)",
-            placeholder="e.g. Use CLO prefix, include CO-PO for 12 POs, subject level is UG...",
-            height=80,
-        )
-        submitted = st.form_submit_button("🚀 Start Generation")
+        submitted = st.form_submit_button("🚀 Analyze & Start", type="primary")
 
     if submitted:
-        if not all([university_id, program, template_file, syllabus_file]):
-            st.error("Please fill all required fields and upload both files.")
+        if not all([univ_id, program, tmpl_file, syll_file]):
+            st.error("Fill all fields and upload both files.")
             return
 
-        # Save uploaded files
-        template_path = _save_upload(template_file, f"{university_id}_template")
-        syllabus_path = _save_upload(syllabus_file, f"{university_id}_syllabus")
+        tmpl_path = _save_upload(tmpl_file, f"{univ_id}_template")
+        syll_path = _save_upload(syll_file, f"{univ_id}_syllabus")
 
-        # Create document record
-        doc = DocumentRecord(university_id=university_id, program=program, semester=int(semester))
+        doc = DocumentRecord(university_id=univ_id, program=program, semester=int(semester))
         db.save_doc(doc)
 
-        initial_state = {
-            "doc_id": doc.doc_id,
-            "university_id": university_id,
-            "template_path": template_path,
-            "syllabus_path": syllabus_path,
-            "custom_instructions": instructions,
-            "program": program,
-            "semester": int(semester),
-            "blueprint": None,
-            "content_model": None,
-            "clarification_answers": {},
-            "ref_decision": None,
-            "generated": False,
-            "docx_path": None,
-            "qa_report": None,
-            "generation_report": {},
-            "error": None,
+        initial = {
+            "doc_id": doc.doc_id, "university_id": univ_id,
+            "template_path": tmpl_path, "syllabus_path": syll_path,
+            "program": program, "semester": int(semester),
+            "blueprint": None, "content_model": None,
+            "detected_gaps": [], "generated_fills": [], "approved_fills": [],
+            "docx_path": None, "pdf_path": None,
+            "qa_report": None, "feedback": "", "version": 0, "final": False,
         }
 
         st.session_state["thread_id"] = doc.doc_id
-        config = {"configurable": {"thread_id": doc.doc_id}}
+        st.session_state["page"] = "Process"
 
-        with st.spinner("Analyzing template and parsing syllabus…"):
+        with st.spinner("Analyzing template structure and parsing syllabus… this takes ~30 seconds."):
             try:
-                graph.invoke(initial_state, config)
+                graph.invoke(initial, {"configurable": {"thread_id": doc.doc_id}})
             except Exception as e:
                 if "interrupt" not in str(e).lower():
-                    st.error(f"Error: {e}")
+                    st.error(f"Error during analysis: {e}")
                     return
 
-        st.session_state["page"] = "Process"
-        st.success(f"Document `{doc.doc_id}` created! Moving to processing…")
+        st.success(f"Analysis complete! Document `{doc.doc_id}` ready.")
         st.rerun()
 
 
+# ── Page: Process (interrupt dispatcher) ─────────────────────────────────────
+
 def page_process():
-    thread_id = ss("thread_id")
-    if not thread_id:
+    tid = ss("thread_id")
+    if not tid:
         st.warning("No active document. Go to **New Document**.")
         return
 
-    next_nodes = _next_nodes()
-    interrupt_val = _interrupt_value()
+    iv = _interrupt()
+    nxt = _next()
 
-    if not next_nodes:
-        st.success("✅ Generation complete! Check the Library.")
+    if not iv and not nxt:
+        st.success("✅ Document complete! Check the **Library** for your DOCX + PDF.")
         return
 
-    # ── Clarification gate ────────────────────────────────────────────────────
-    if interrupt_val and interrupt_val.get("type") == "questions":
-        st.header("❓ Clarification Required")
-        st.caption(f"Document: `{thread_id}`")
-        questions = interrupt_val.get("questions", [])
-
-        with st.form("clarify_form"):
-            answers = {}
-            for q in questions:
-                opts = q.get("options", [])
-                ans = st.radio(q["question"], opts, key=q["id"])
-                answers[q["question"]] = ans
-            submitted = st.form_submit_button("Submit Answers")
-
-        if submitted:
-            config = _config()
-            with st.spinner("Generating academic content…"):
-                try:
-                    graph.invoke(Command(resume=answers), config)
-                except Exception as e:
-                    if "interrupt" not in str(e).lower():
-                        st.error(f"Error: {e}")
-                        return
-            st.rerun()
-
-    # ── Approval gate ─────────────────────────────────────────────────────────
-    elif interrupt_val and interrupt_val.get("type") == "approval":
-        page_review_gate(interrupt_val)
-
+    if iv:
+        kind = iv.get("type")
+        if kind == "content_review":
+            page_content_review(iv)
+        elif kind == "preview":
+            page_preview(iv)
+        else:
+            st.info(f"Waiting at: `{kind}`")
     else:
-        st.info(f"⏳ Processing… next: `{next_nodes}`")
+        st.info(f"⏳ Processing… (`{nxt[0] if nxt else '?'}`)")
         if st.button("Refresh"):
             st.rerun()
 
 
-def page_review_gate(interrupt_val: dict):
-    st.header("🔍 Review & Approve")
-    doc_id = interrupt_val.get("doc_id", ss("thread_id"))
-    version = interrupt_val.get("version", "?")
-    docx_path = interrupt_val.get("docx_path", "")
-    qa = interrupt_val.get("qa_report", {})
-    gen = interrupt_val.get("generation_report", {})
+# ── Gate 1: Content Review ────────────────────────────────────────────────────
 
-    col1, col2 = st.columns([3, 1])
-    with col1:
-        st.subheader(f"Version {version}")
-        st.metric("QA Score", f"{qa.get('score', 0):.0%}")
+def page_content_review(iv: dict):
+    fills: list[dict] = iv.get("fills", [])
+
+    st.header("✏️ Review LLM-Generated Content")
+    st.info(
+        "The syllabus didn't have enough content for some sections. "
+        "The LLM has generated the missing content below. "
+        "**Review each section, edit if needed, then approve.**"
+    )
+
+    approved_items = []
+    all_ok = True
+
+    for i, fill in enumerate(fills):
+        subj   = fill.get("subject", "Unknown Subject")
+        section = fill.get("section", "")
+        note   = fill.get("generation_note", "")
+        items  = fill.get("content", [])
+
+        with st.expander(f"📌 **{subj}** — `{section}`  ·  *{note}*", expanded=True):
+            st.caption(f"Gap reason: {fill.get('gap', {}).get('reason', '')}")
+
+            edited = []
+            for j, item in enumerate(items):
+                val = st.text_area(
+                    f"Item {j+1}", value=item,
+                    key=f"fill_{i}_{j}", height=60,
+                )
+                edited.append(val.strip())
+
+            action = st.radio(
+                "Action", ["✅ Approve", "❌ Skip (leave blank)"],
+                key=f"action_{i}", horizontal=True,
+            )
+
+            if "Approve" in action:
+                approved_items.append({**fill, "approved_content": edited})
+            else:
+                all_ok = False  # at least one skipped
+
+    st.divider()
+    if st.button("Confirm and Assemble Document →", type="primary"):
+        _invoke(approved_items)
+        st.session_state["page"] = "Process"
+        st.rerun()
+
+
+# ── Gate 2: Preview + Feedback ────────────────────────────────────────────────
+
+def page_preview(iv: dict):
+    docx_path = iv.get("docx_path", "")
+    qa        = iv.get("qa_report", {})
+    version   = iv.get("version", 1)
+    content   = iv.get("content_model", {})
+
+    st.header(f"🔍 Document Preview — Version {version}")
+    c1, c2 = st.columns([2, 1])
+
+    with c1:
+        _render_preview(content)
+
+    with c2:
+        # QA badge
+        score = qa.get("score", 0)
+        color = "normal" if score >= 0.9 else "inverse"
+        st.metric("QA Score", f"{score:.0%}", help="Checks: content preservation, structure, completeness")
         if qa.get("findings"):
-            st.warning("QA Issues:")
-            for f in qa["findings"]:
-                st.write(f"  ⚠️ {f['check']}: {f['detail']}")
+            with st.expander("QA Issues"):
+                for f in qa["findings"]:
+                    st.write(f"⚠️ `{f['check']}`: {f['detail']}")
 
-        st.subheader("Generation Report")
-        for s in gen.get("subjects", []):
-            st.write(f"**{s['name']}** — {s['objectives_generated']} objectives, {s['outcomes_generated']} outcomes, {s['modules_refined']} modules refined")
-
-    with col2:
+        # Download for detailed review in Word
         if docx_path and Path(docx_path).exists():
             with open(docx_path, "rb") as f:
-                st.download_button("⬇ Preview DOCX", f, file_name=Path(docx_path).name, type="primary")
+                st.download_button("⬇ Download DOCX to review in Word", f,
+                                   Path(docx_path).name, type="secondary")
 
-        reviewer = st.text_input("Your name / email", key="reviewer_id")
+        st.divider()
+        st.subheader("Your Decision")
+        tab_approve, tab_feedback = st.tabs(["✅ Approve & Export", "🔄 Request Changes"])
 
-        if st.button("✅ Approve", type="primary"):
-            if not reviewer:
-                st.error("Enter your name before approving.")
-            else:
-                from ase.approval.workflow import approve as do_approve
-                do_approve(doc_id, reviewer)
-                config = _config()
-                graph.invoke(Command(resume={"decision": "approve", "reviewer": reviewer, "notes": ""}), config)
-                st.success("Document approved and stored!")
+        with tab_approve:
+            st.write("Approve this version. It will be exported as **DOCX + PDF** and stored.")
+            if st.button("Approve & Export Final Document", type="primary"):
+                _invoke({"approved": True, "feedback": ""})
                 st.rerun()
 
-        notes = st.text_area("Change request notes", key="change_notes", height=80)
-        if st.button("🔄 Request Changes"):
-            if not reviewer:
-                st.error("Enter your name.")
-            elif not notes:
-                st.error("Provide change notes.")
-            else:
-                from ase.approval.workflow import request_changes as do_req
-                do_req(doc_id, reviewer, notes)
-                config = _config()
-                graph.invoke(Command(resume={"decision": "request_changes", "reviewer": reviewer, "notes": notes}), config)
-                st.info("Changes requested. Re-generation will start.")
-                st.rerun()
+        with tab_feedback:
+            st.write("Describe what needs to change. The engine will re-generate and rebuild.")
+            feedback = st.text_area(
+                "Feedback / Change Request",
+                placeholder="e.g. The objectives for Web Development are too generic. Make them more specific to React and Node.js. Also add more practical outcomes.",
+                height=120,
+            )
+            if st.button("Submit Feedback →", type="secondary"):
+                if not feedback.strip():
+                    st.error("Please enter feedback before submitting.")
+                else:
+                    _invoke({"approved": False, "feedback": feedback})
+                    st.rerun()
 
-        if st.button("❌ Reject"):
-            if reviewer:
-                from ase.approval.workflow import reject as do_reject
-                do_reject(doc_id, reviewer, notes or "Rejected")
-                config = _config()
-                graph.invoke(Command(resume={"decision": "reject", "reviewer": reviewer, "notes": notes}), config)
-                st.error("Document rejected.")
-                st.rerun()
+
+def _render_preview(content_dict: dict):
+    """Render a structured in-browser preview of the document content."""
+    if not content_dict:
+        st.warning("No content to preview.")
+        return
+
+    try:
+        content = ContentModel(**content_dict)
+    except Exception:
+        st.json(content_dict)
+        return
+
+    st.subheader(f"📋 {content.program}  |  Semester {content.semester}")
+
+    for subj in content.subjects:
+        with st.expander(f"**{subj.name}**" + (f"  `{subj.code}`" if subj.code else ""), expanded=False):
+            # Objectives
+            st.markdown("**Course Objectives (CLO/CO):**")
+            objs = subj.generated_objectives or subj.objectives
+            for o in objs:
+                st.write(f"  • {o}")
+
+            # Outcomes
+            st.markdown("**Course Outcomes:**")
+            outs = subj.generated_outcomes or subj.outcomes
+            for o in outs:
+                st.write(f"  • {o}")
+
+            # Modules
+            st.markdown("**Modules:**")
+            for m in subj.modules:
+                st.write(f"  **{m.label}: {m.title}**")
+                st.caption(f"  {m.topics[:120]}{'…' if len(m.topics) > 120 else ''}")
+
+            # References
+            refs = subj.generated_references or subj.textbooks
+            if refs:
+                st.markdown("**Textbooks / References:**")
+                for r in refs[:3]:
+                    st.caption(f"  {r[:100]}…")
+
+            # CO-PO
+            if subj.copo:
+                po_count = subj.copo.get("po_count", 12)
+                st.caption(f"CO-PO Matrix: {po_count} POs, scale: {subj.copo.get('scale', [])}")
 
 
 # ── Navigation ────────────────────────────────────────────────────────────────
@@ -275,25 +337,23 @@ def main():
     with st.sidebar:
         st.title("📄 ASDE")
         st.caption("Academic Syllabus Document Engine")
-        page = st.radio(
-            "Navigation",
-            ["Library", "New Document", "Process"],
-            index=["Library", "New Document", "Process"].index(ss("page", "Library")),
-        )
+        page = st.radio("", ["Library", "New Document", "Process"],
+                        index=["Library", "New Document", "Process"].index(ss("page", "Library")))
         st.session_state["page"] = page
-        st.divider()
+
         if ss("thread_id"):
-            st.caption(f"Active doc: `{ss('thread_id')[:12]}…`")
-            next_n = _next_nodes()
-            interrupt_v = _interrupt_value()
-            if interrupt_v:
-                kind = interrupt_v.get("type", "")
-                label = "❓ Awaiting Answers" if kind == "questions" else "🔍 Awaiting Approval"
-                st.warning(label)
-            elif next_n:
-                st.info(f"⏳ Next: {next_n[0]}")
+            st.divider()
+            st.caption(f"Active: `{ss('thread_id')[:14]}…`")
+            iv = _interrupt()
+            if iv:
+                kind = iv.get("type", "")
+                labels = {"content_review": "✏️ Awaiting content review",
+                          "preview": "🔍 Awaiting preview approval"}
+                st.info(labels.get(kind, f"⏸ {kind}"))
+            elif _next():
+                st.info("⏳ Processing…")
             else:
-                st.success("✅ Done")
+                st.success("✅ Complete")
 
     if page == "Library":
         page_library()
