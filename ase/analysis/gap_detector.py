@@ -1,11 +1,8 @@
-"""Detect content gaps between template sections and parsed syllabus content.
-Then generate LLM content to fill each gap."""
+"""Detect content gaps between template sections and parsed syllabus; fill them with LLM."""
 import json
-import anthropic
-from ase.config import MODEL, MAX_TOKENS
+from ase.config import MAX_TOKENS
+from ase.llm import complete
 from ase.schemas.models import TemplateBlueprint, ContentModel, SubjectContent
-
-_client = anthropic.Anthropic()
 
 _DETECT_SYSTEM = "You are an academic document analyst. Return only valid JSON."
 
@@ -68,7 +65,6 @@ Return JSON:
 
 
 def detect_gaps(blueprint: TemplateBlueprint, content: ContentModel) -> list[dict]:
-    """Ask Claude to identify what content is missing per template section."""
     summary = [
         {
             "name": s.name,
@@ -82,38 +78,29 @@ def detect_gaps(blueprint: TemplateBlueprint, content: ContentModel) -> list[dic
         for s in content.subjects
     ]
 
-    resp = _client.messages.create(
-        model=MODEL, max_tokens=2048, system=_DETECT_SYSTEM,
-        messages=[{"role": "user", "content": _DETECT_PROMPT.format(
-            sections=json.dumps(blueprint.sections_order + list(blueprint.label_dictionary.keys())),
-            has_sections=json.dumps(blueprint.has_sections),
-            content_summary=json.dumps(summary, indent=2),
-        )}],
-    )
-    raw = _clean_json(resp.content[0].text)
-    return json.loads(raw).get("gaps", [])
+    raw = complete(_DETECT_SYSTEM, _DETECT_PROMPT.format(
+        sections=json.dumps(blueprint.sections_order + list(blueprint.label_dictionary.keys())),
+        has_sections=json.dumps(blueprint.has_sections),
+        content_summary=json.dumps(summary, indent=2),
+    ), 2048)
+    return json.loads(_clean(raw)).get("gaps", [])
 
 
 def fill_gap(gap: dict, subject: SubjectContent, blueprint: TemplateBlueprint,
              program: str, semester: int) -> dict:
-    """Generate content for a single gap using Claude."""
-    resp = _client.messages.create(
-        model=MODEL, max_tokens=MAX_TOKENS, system=_FILL_SYSTEM,
-        messages=[{"role": "user", "content": _FILL_PROMPT.format(
-            subject_name=subject.name,
-            section=gap["section"],
-            reason=gap["reason"],
-            program=program,
-            semester=semester,
-            tone=blueprint.tone,
-            obj_code=blueprint.label_dictionary.get("objective_code", "CLO"),
-            existing_objectives="; ".join(subject.objectives[:3]) or "None",
-            existing_outcomes="; ".join(subject.outcomes[:3]) or "None",
-            existing_modules="; ".join(f"{m.label}: {m.title}" for m in subject.modules[:3]) or "None",
-        )}],
-    )
-    raw = _clean_json(resp.content[0].text)
-    result = json.loads(raw)
+    raw = complete(_FILL_SYSTEM, _FILL_PROMPT.format(
+        subject_name=subject.name,
+        section=gap["section"],
+        reason=gap["reason"],
+        program=program,
+        semester=semester,
+        tone=blueprint.tone,
+        obj_code=blueprint.label_dictionary.get("objective_code", "CLO"),
+        existing_objectives="; ".join(subject.objectives[:3]) or "None",
+        existing_outcomes="; ".join(subject.outcomes[:3]) or "None",
+        existing_modules="; ".join(f"{m.label}: {m.title}" for m in subject.modules[:3]) or "None",
+    ), MAX_TOKENS)
+    result = json.loads(_clean(raw))
     result["subject"] = subject.name
     result["gap"] = gap
     return result
@@ -121,19 +108,15 @@ def fill_gap(gap: dict, subject: SubjectContent, blueprint: TemplateBlueprint,
 
 def fill_all_gaps(gaps: list[dict], content: ContentModel,
                   blueprint: TemplateBlueprint) -> list[dict]:
-    """Fill every detected gap. Returns list of generated content items for human review."""
     subject_map = {s.name: s for s in content.subjects}
-    generated = []
-    for gap in gaps:
-        subj = subject_map.get(gap["subject"])
-        if subj:
-            result = fill_gap(gap, subj, blueprint, content.program, content.semester)
-            generated.append(result)
-    return generated
+    return [
+        fill_gap(gap, subj, blueprint, content.program, content.semester)
+        for gap in gaps
+        if (subj := subject_map.get(gap["subject"])) is not None
+    ]
 
 
 def apply_approved_content(content: ContentModel, approved_items: list[dict]) -> ContentModel:
-    """Merge human-approved generated content back into the content model."""
     subject_map = {s.name: i for i, s in enumerate(content.subjects)}
     for item in approved_items:
         idx = subject_map.get(item.get("subject"))
@@ -152,10 +135,10 @@ def apply_approved_content(content: ContentModel, approved_items: list[dict]) ->
     return content
 
 
-def _clean_json(text: str) -> str:
+def _clean(text: str) -> str:
     text = text.strip()
     if text.startswith("```"):
         text = text.split("```")[1]
         if text.startswith("json"):
             text = text[4:]
-    return text.strip()
+    return text.strip().rstrip("```")

@@ -1,10 +1,8 @@
-"""Detect reference sections, generate IEEE-formatted references with ISBN verification."""
+"""Generate IEEE-formatted references with ISBN via LLM."""
 import json
-import anthropic
-from ase.config import MODEL, MAX_TOKENS
+from ase.config import MAX_TOKENS
+from ase.llm import complete
 from ase.schemas.models import SubjectContent, TemplateBlueprint
-
-_client = anthropic.Anthropic()
 
 _SYSTEM = """You are an academic librarian and IEEE citation expert.
 Generate accurate, verifiable academic references. Return only valid JSON."""
@@ -43,42 +41,29 @@ def generate_references(
     program: str,
     semester: int,
 ) -> tuple[list[str], list[str]]:
-    """Generate IEEE-formatted textbooks and references for a subject."""
-    # Determine level from program name
     level = "Undergraduate (UG)"
     prog_lower = program.lower()
     if "diploma" in prog_lower:
         level = "Diploma"
-    elif "m.tech" in prog_lower or "mba" in prog_lower or "msc" in prog_lower or "pg" in prog_lower:
+    elif any(x in prog_lower for x in ("m.tech", "mba", "msc", "pg")):
         level = "Postgraduate (PG)"
 
-    modules_summary = "; ".join(
-        f"{m.label}: {m.title}" for m in subject.modules[:5]
-    )
+    modules_summary = "; ".join(f"{m.label}: {m.title}" for m in subject.modules[:5])
 
-    resp = _client.messages.create(
-        model=MODEL,
-        max_tokens=MAX_TOKENS,
-        system=_SYSTEM,
-        messages=[{"role": "user", "content": _REF_PROMPT.format(
-            name=subject.name,
-            level=level,
-            modules=modules_summary,
-            program=program,
-        )}],
-    )
+    raw = complete(_SYSTEM, _REF_PROMPT.format(
+        name=subject.name, level=level,
+        modules=modules_summary, program=program,
+    ), MAX_TOKENS).strip()
 
-    raw = resp.content[0].text.strip()
     if raw.startswith("```"):
         raw = raw.split("```")[1]
         if raw.startswith("json"):
             raw = raw[4:]
 
-    data = json.loads(raw)
+    data = json.loads(raw.strip().rstrip("```"))
     return data.get("textbooks", []), data.get("references", [])
 
 
 def has_ref_sections(blueprint: TemplateBlueprint) -> bool:
-    """Check if template has textbook or reference sections."""
     hs = blueprint.has_sections
     return hs.get("textbooks", False) or hs.get("references", False) or hs.get("suggested_reading", False)

@@ -1,10 +1,8 @@
-"""Extract a Template Blueprint from a university DOCX via Claude."""
+"""Extract a Template Blueprint from a university DOCX."""
 import json
-import anthropic
-from ase.config import MODEL, MAX_TOKENS
+from ase.config import MAX_TOKENS
+from ase.llm import complete
 from ase.schemas.models import TemplateBlueprint
-
-_client = anthropic.Anthropic()
 
 _SYSTEM = """You are an academic document analyst. Extract template blueprints from university syllabus templates.
 Return only valid JSON — no markdown fences, no commentary."""
@@ -43,8 +41,6 @@ Return this exact JSON structure (fill all fields from the template data):
 
 
 def extract_blueprint(template_data: dict, university_id: str) -> TemplateBlueprint:
-    """Use Claude to extract a structured blueprint from parsed template data."""
-    # Truncate to fit context window
     data_str = json.dumps({
         "paragraphs": template_data.get("paragraphs", [])[:40],
         "tables": template_data.get("tables", [])[:8],
@@ -52,19 +48,12 @@ def extract_blueprint(template_data: dict, university_id: str) -> TemplateBluepr
         "styles": dict(list(template_data.get("styles", {}).items())[:20]),
     }, indent=2)
 
-    resp = _client.messages.create(
-        model=MODEL,
-        max_tokens=MAX_TOKENS,
-        system=_SYSTEM,
-        messages=[{"role": "user", "content": _PROMPT.format(data=data_str[:12000])}],
-    )
-
-    raw = resp.content[0].text.strip()
-    # Strip markdown code fences if present
+    raw = complete(_SYSTEM, _PROMPT.format(data=data_str[:12000]), MAX_TOKENS).strip()
     if raw.startswith("```"):
         raw = raw.split("```")[1]
         if raw.startswith("json"):
             raw = raw[4:]
+    raw = raw.strip().rstrip("```")
 
     blueprint_dict = json.loads(raw)
     blueprint_dict["university_id"] = university_id

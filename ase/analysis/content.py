@@ -1,10 +1,8 @@
-"""Extract ContentModels for all semesters from a NIAT standard syllabus via Claude."""
+"""Extract ContentModels for all semesters from a NIAT standard syllabus."""
 import json
-import anthropic
-from ase.config import MODEL, MAX_TOKENS
+from ase.config import MAX_TOKENS
+from ase.llm import complete
 from ase.schemas.models import ContentModel
-
-_client = anthropic.Anthropic()
 
 _SYSTEM = """You are an academic content extractor. Extract syllabus content into structured JSON.
 Preserve all text VERBATIM — never paraphrase or reorder. Return only valid JSON."""
@@ -58,10 +56,7 @@ def extract_all_semesters(
     syllabus_data: dict,
     num_semesters: int,
 ) -> tuple[str, dict[int, ContentModel]]:
-    """
-    Parse the full NIAT syllabus and return content for all N semesters.
-    Returns (program_name, {1: ContentModel, 2: ContentModel, ...}).
-    """
+    """Parse the full NIAT syllabus and return content for all N semesters."""
     text = (
         syllabus_data.get("full_text", "")
         or "\n".join(syllabus_data.get("paragraphs", []))
@@ -74,17 +69,12 @@ def extract_all_semesters(
 
     full_input = f"{text}\n\nTABLE DATA:\n{tables_text}"
 
-    resp = _client.messages.create(
-        model=MODEL,
-        max_tokens=MAX_TOKENS,
-        system=_SYSTEM,
-        messages=[{"role": "user", "content": _PROMPT.format(
-            num_semesters=num_semesters,
-            text=full_input[:14000],
-        )}],
-    )
+    raw = complete(
+        _SYSTEM,
+        _PROMPT.format(num_semesters=num_semesters, text=full_input[:14000]),
+        MAX_TOKENS,
+    ).strip()
 
-    raw = resp.content[0].text.strip()
     if raw.startswith("```"):
         raw = raw.split("```")[1]
         if raw.startswith("json"):

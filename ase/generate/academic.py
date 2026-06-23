@@ -1,10 +1,8 @@
-"""Generate Bloom-aligned CO/CLO and refined modules via Claude."""
+"""Generate Bloom-aligned CO/CLO and refined modules."""
 import json
-import anthropic
-from ase.config import MODEL, MAX_TOKENS
+from ase.config import MAX_TOKENS
+from ase.llm import complete
 from ase.schemas.models import SubjectContent, TemplateBlueprint
-
-_client = anthropic.Anthropic()
 
 _SYSTEM = """You are a University Curriculum & Academic Documentation Specialist.
 Generate accreditation-ready academic content aligned to Bloom's Taxonomy.
@@ -46,34 +44,22 @@ def generate_objectives_outcomes(
     program: str,
     semester: int,
 ) -> tuple[list[str], list[str]]:
-    """Generate Bloom-aligned objectives and outcomes for a subject."""
     code_label = blueprint.label_dictionary.get("objective_code", "CLO")
-    tone = blueprint.tone or "formal-academic"
-
     existing_obj = "\n".join(f"- {o}" for o in subject.objectives) or "None provided"
 
-    resp = _client.messages.create(
-        model=MODEL,
-        max_tokens=2048,
-        system=_SYSTEM,
-        messages=[{"role": "user", "content": _OBJ_PROMPT.format(
-            name=subject.name,
-            program=program,
-            semester=semester,
-            existing=existing_obj,
-            tone=tone,
-            code_label=code_label,
-            label_type="Learning Objective" if code_label == "CLO" else "Objective",
-        )}],
-    )
+    raw = complete(_SYSTEM, _OBJ_PROMPT.format(
+        name=subject.name, program=program, semester=semester,
+        existing=existing_obj, tone=blueprint.tone or "formal-academic",
+        code_label=code_label,
+        label_type="Learning Objective" if code_label == "CLO" else "Objective",
+    ), 2048).strip()
 
-    raw = resp.content[0].text.strip()
     if raw.startswith("```"):
         raw = raw.split("```")[1]
         if raw.startswith("json"):
             raw = raw[4:]
 
-    data = json.loads(raw)
+    data = json.loads(raw.strip().rstrip("```"))
     return data.get("objectives", []), data.get("outcomes", [])
 
 
@@ -91,32 +77,19 @@ Preserve ALL original topics — never remove or invent content."""
 
 
 def refine_module_topics(subject: SubjectContent, blueprint: TemplateBlueprint) -> SubjectContent:
-    """Return subject with academically refined module descriptions."""
-    tone = blueprint.tone or "formal-academic"
     refined_modules = []
-
     for mod in subject.modules:
         try:
-            resp = _client.messages.create(
-                model=MODEL,
-                max_tokens=1024,
-                system=_SYSTEM,
-                messages=[{"role": "user", "content": _MODULE_PROMPT.format(
-                    name=subject.name,
-                    label=mod.label,
-                    title=mod.title,
-                    topics=mod.topics,
-                    tone=tone,
-                )}],
-            )
-            raw = resp.content[0].text.strip()
+            raw = complete(_SYSTEM, _MODULE_PROMPT.format(
+                name=subject.name, label=mod.label, title=mod.title,
+                topics=mod.topics, tone=blueprint.tone or "formal-academic",
+            ), 1024).strip()
             if raw.startswith("```"):
                 raw = raw.split("```")[1]
                 if raw.startswith("json"):
                     raw = raw[4:]
-            data = json.loads(raw)
+            data = json.loads(raw.strip().rstrip("```"))
             refined_modules.append(mod.model_copy(update={"topics": data.get("refined_topics", mod.topics)}))
         except Exception:
             refined_modules.append(mod)
-
     return subject.model_copy(update={"modules": refined_modules})

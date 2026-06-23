@@ -1,11 +1,7 @@
 """LLM-powered: analyze reviewer feedback → extract changes → draft formal reply email."""
 import json
-import anthropic
-from ase.config import MODEL, MAX_TOKENS
-
-_client = anthropic.Anthropic()
-
-# ── Analyze reviewer feedback ─────────────────────────────────────────────────
+from ase.config import MAX_TOKENS
+from ase.llm import complete
 
 _ANALYZE_SYSTEM = "You are an academic document reviewer. Extract specific change requests from reviewer feedback. Return only valid JSON."
 
@@ -31,18 +27,11 @@ Return JSON:
 
 
 def analyze_feedback(feedback_text: str, program: str, semester: int) -> dict:
-    """Extract structured change requests from a reviewer's email reply."""
-    resp = _client.messages.create(
-        model=MODEL, max_tokens=1024, system=_ANALYZE_SYSTEM,
-        messages=[{"role": "user", "content": _ANALYZE_PROMPT.format(
-            program=program, semester=semester, feedback=feedback_text,
-        )}],
-    )
-    raw = _clean(resp.content[0].text)
-    return json.loads(raw)
+    raw = complete(_ANALYZE_SYSTEM, _ANALYZE_PROMPT.format(
+        program=program, semester=semester, feedback=feedback_text,
+    ), 1024)
+    return json.loads(_clean(raw))
 
-
-# ── Generate formal reply email ───────────────────────────────────────────────
 
 _REPLY_SYSTEM = (
     "You are an academic correspondence specialist at NxtWave / NIAT. "
@@ -95,25 +84,14 @@ def generate_reply_body(
     docx_name: str,
     pdf_name: str,
 ) -> str:
-    """Generate a formal reply email body using LLM."""
     changes_list = "\n".join(f"  {i+1}. {c}" for i, c in enumerate(changes_made))
+    return complete(_REPLY_SYSTEM, _REPLY_PROMPT.format(
+        program=program, semester=semester, university=university,
+        prev_version=prev_version, new_version=new_version,
+        reviewer_name=reviewer_name, feedback_summary=feedback_summary,
+        changes_list=changes_list, docx_name=docx_name, pdf_name=pdf_name,
+    ), MAX_TOKENS).strip()
 
-    resp = _client.messages.create(
-        model=MODEL, max_tokens=MAX_TOKENS, system=_REPLY_SYSTEM,
-        messages=[{"role": "user", "content": _REPLY_PROMPT.format(
-            program=program, semester=semester, university=university,
-            prev_version=prev_version, new_version=new_version,
-            reviewer_name=reviewer_name,
-            feedback_summary=feedback_summary,
-            changes_list=changes_list,
-            docx_name=docx_name,
-            pdf_name=pdf_name,
-        )}],
-    )
-    return resp.content[0].text.strip()
-
-
-# ── Apply feedback to content model ──────────────────────────────────────────
 
 _REVISE_SYSTEM = "You are a University Curriculum Specialist. Revise syllabus content based on reviewer feedback. Return only valid JSON."
 
@@ -150,8 +128,6 @@ def apply_feedback_to_content(
     program: str,
     semester: int,
 ) -> tuple[dict, list[str]]:
-    """Use LLM to revise content model based on reviewer's change requests.
-    Returns (updated_content_dict, changes_made_list)."""
     from ase.schemas.models import ContentModel
     content = ContentModel(**content_dict)
 
@@ -165,17 +141,13 @@ def apply_feedback_to_content(
         for s in content.subjects
     ]
 
-    resp = _client.messages.create(
-        model=MODEL, max_tokens=MAX_TOKENS, system=_REVISE_SYSTEM,
-        messages=[{"role": "user", "content": _REVISE_PROMPT.format(
-            program=program, semester=semester,
-            content_summary=json.dumps(summary, indent=2),
-            changes="\n".join(f"- {c}" for c in changes_requested),
-        )}],
-    )
+    raw = complete(_REVISE_SYSTEM, _REVISE_PROMPT.format(
+        program=program, semester=semester,
+        content_summary=json.dumps(summary, indent=2),
+        changes="\n".join(f"- {c}" for c in changes_requested),
+    ), MAX_TOKENS)
 
-    raw = _clean(resp.content[0].text)
-    data = json.loads(raw)
+    data = json.loads(_clean(raw))
     changes_made: list[str] = data.get("changes_made", [])
 
     subj_map = {s.name: i for i, s in enumerate(content.subjects)}
@@ -196,4 +168,4 @@ def _clean(text: str) -> str:
         text = text.split("```")[1]
         if text.startswith("json"):
             text = text[4:]
-    return text.strip()
+    return text.strip().rstrip("```")

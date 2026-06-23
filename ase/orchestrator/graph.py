@@ -241,10 +241,9 @@ def node_preview(state: ASEState) -> dict:
 
 def node_apply_feedback(state: ASEState) -> dict:
     """Apply human feedback to the appropriate semester content model(s)."""
-    import anthropic
-    from ase.config import MODEL, MAX_TOKENS
+    from ase.config import MAX_TOKENS
+    from ase.llm import complete
 
-    client = anthropic.Anthropic()
     feedback = state.get("feedback", "")
     updated_contents = dict(state["semester_contents"])
 
@@ -272,11 +271,7 @@ Return JSON:
 }}
 If feedback does not apply to Semester {sem}, return: {{"applies": false, "updates": []}}"""
 
-        resp = client.messages.create(
-            model=MODEL, max_tokens=MAX_TOKENS,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        raw = resp.content[0].text.strip()
+        raw = complete("", prompt, MAX_TOKENS).strip()
         if raw.startswith("```"):
             raw = raw.split("```")[1]
             if raw.startswith("json"):
